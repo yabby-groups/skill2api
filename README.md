@@ -10,7 +10,7 @@ user decision.
 - The Skill2API worker registers `skill2api_generate`, `skill2api_status`,
   `skill2api_resume`, and `skill2api_terminate`.
 - `skill_name` resolves to `SKILL2API_SKILLS_DIR/<skill_name>/SKILL.md`.
-- `output_dir` is inside `SKILL2API_OUTPUT_ROOT`.
+- `output_dir` is a relative path inside `SKILL2API_OUTPUT_ROOT`.
 
 The examples below use `request-1`. The Periodic job name and the payload's
 `request_id` must match.
@@ -22,7 +22,7 @@ periodic run skill2api_generate request-1 \
   --workload '{
     "request_id": "request-1",
     "skill_name": "myna-health-check",
-    "output_dir": "/path/to/SKILL2API_OUTPUT_ROOT/request-1",
+    "output_dir": "request-1",
     "prompt": "Generate the requested health-check package.",
     "force": false
   }' \
@@ -56,7 +56,19 @@ job name. The normal states are:
 
 Poll every few seconds until the job reaches `succeeded`, `failed`,
 `waiting_for_input`, or `terminated`. Skill2API does not fabricate percentage progress; while a
-job is executing, the reliable progress signal is `running`.
+job is executing, the reliable progress signal is `running`. Each status query
+also reads the current tails of `stdout.log` and `stderr.log` from the job
+directory into the response's `stdout` and `stderr` fields. Each field contains
+at most `SKILL2API_MAX_OUTPUT_BYTES` bytes (64 KiB by default); when older
+output is omitted, the field starts with `[earlier output truncated]`.
+
+Codex writes complete output directly to
+`SKILL2API_OUTPUT_ROOT/<request_id>/stdout.log` and `stderr.log`. These files
+are updated while Codex runs. The worker does not rewrite `status.json` for
+output changes: log tails are read only when `skill2api_status` is called.
+Caller-provided prompts and resume answers are redacted before either log is
+written. Codex session IDs are also redacted from public logs and status
+responses; the worker retains the ID privately for resume.
 
 ## Terminate a Job
 
@@ -138,5 +150,7 @@ persisted but is never returned by the status function.
   The caller should constrain the UI selection, and the skill should validate
   the answer after resuming.
 - Status is stored at
-  `SKILL2API_OUTPUT_ROOT/<request_id>/status.json`. Generated files and the
-  status file are kept in the job's `output_dir`.
+  `SKILL2API_OUTPUT_ROOT/<request_id>/status.json`. Generated files, the status
+  file, and `stdout.log`/`stderr.log` are kept in the job's `output_dir`.
+- A resumed task appends to its existing log files. A new generation or a
+  `force` rerun truncates them before Codex starts.

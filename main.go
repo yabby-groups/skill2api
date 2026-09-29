@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -26,6 +28,8 @@ const (
 	terminateFunc = "skill2api_terminate"
 	maxOutput     = 64 * 1024
 	maxSkillName  = 128
+	stdoutLogName = "stdout.log"
+	stderrLogName = "stderr.log"
 )
 
 type generateRequest struct {
@@ -60,8 +64,8 @@ type taskStatus struct {
 	OutputDir  string   `json:"output_dir"`
 	Files      []string `json:"files"`
 	Error      string   `json:"error"`
-	Stdout     string   `json:"stdout"`
-	Stderr     string   `json:"stderr"`
+	Stdout     string   `json:"stdout,omitempty"`
+	Stderr     string   `json:"stderr,omitempty"`
 	Phase      string   `json:"phase,omitempty"`
 	Question   string   `json:"question,omitempty"`
 	Options    []string `json:"options,omitempty"`
@@ -94,6 +98,20 @@ func publicStatus(v taskStatus) statusResponse {
 		OutputDir: v.OutputDir, Files: v.Files, Error: v.Error, Stdout: v.Stdout,
 		Stderr: v.Stderr, Phase: v.Phase, Question: v.Question, Options: v.Options,
 	}
+}
+
+func statusWithLogOutput(v taskStatus, limit int) (statusResponse, error) {
+	response := publicStatus(v)
+	stdout, err := readOutputTail(filepath.Join(v.OutputDir, stdoutLogName), limit)
+	if err != nil {
+		return response, fmt.Errorf("read %s: %w", stdoutLogName, err)
+	}
+	stderr, err := readOutputTail(filepath.Join(v.OutputDir, stderrLogName), limit)
+	if err != nil {
+		return response, fmt.Errorf("read %s: %w", stderrLogName, err)
+	}
+	response.Stdout, response.Stderr = stdout, stderr
+	return response, nil
 }
 
 type config struct {
@@ -278,7 +296,7 @@ func (s *statusStore) claimWaiting(id string) (taskStatus, error) {
 		return v, errors.New("request is not waiting for input")
 	}
 	v.Status = "running"
-	v.Question, v.Options, v.Phase, v.Error = "", nil, "", ""
+	v.Question, v.Options, v.Phase, v.Error, v.Stdout, v.Stderr = "", nil, "", "", "", ""
 	if err := s.writeUnlocked(v); err != nil {
 		return taskStatus{}, err
 	}
@@ -347,16 +365,8 @@ func validateRequest(req generateRequest, c config) error {
 	if strings.TrimSpace(req.Prompt) == "" {
 		return errors.New("prompt is required")
 	}
-	root, err := filepath.Abs(c.OutputRoot)
-	if err != nil {
+	if _, err := resolveOutputDir(req.OutputDir, c.OutputRoot); err != nil {
 		return err
-	}
-	out, err := filepath.Abs(req.OutputDir)
-	if err != nil {
-		return err
-	}
-	if !within(root, out) || out == root {
-		return errors.New("output_dir must be inside SKILL2API_OUTPUT_ROOT")
 	}
 	skillRoot, err := filepath.Abs(c.SkillsDir)
 	if err != nil {
@@ -369,6 +379,25 @@ func validateRequest(req generateRequest, c config) error {
 		return fmt.Errorf("skill not found: %w", err)
 	}
 	return nil
+}
+
+func resolveOutputDir(raw, root string) (string, error) {
+	rel := strings.TrimSpace(raw)
+	if rel == "" || filepath.IsAbs(rel) {
+		return "", errors.New("output_dir must be relative to SKILL2API_OUTPUT_ROOT")
+	}
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	out, err := filepath.Abs(filepath.Join(root, rel))
+	if err != nil {
+		return "", err
+	}
+	if !within(root, out) {
+		return "", errors.New("output_dir must be inside SKILL2API_OUTPUT_ROOT")
+	}
+	return out, nil
 }
 func validID(s string) bool {
 	if s == "" || len(s) > 128 || s == "." || s == ".." {
@@ -451,58 +480,223 @@ func sessionIDFromStderr(stderr string) string {
 }
 
 func runCodex(ctx context.Context, c config, req generateRequest, skill []byte) (string, string, error) {
+	stdout, stderr, _, err := runCodexWithSession(ctx, c, req, skill)
+	return stdout, stderr, err
+}
+
+func runCodexWithSession(ctx context.Context, c config, req generateRequest, skill []byte) (string, string, string, error) {
 	prompt := fmt.Sprintf("%s\n\nUse the skill instructions below to implement the request as a reviewable Myna Sanic blueprint package. Write the blueprint, route entry, dependency notes, and README into the current working directory (%s). Do not modify files outside that directory.\n\nIf you need user information before continuing, do not guess. End your response with exactly two lines: SKILL2API_INPUT_REQUIRED and then a JSON object containing question and optional options.\n\nSkill instructions:\n%s", req.Prompt, req.OutputDir, string(skill))
-	return runCodexCommand(ctx, c, req.OutputDir, []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", prompt})
+	return runCodexCommand(ctx, c, req.OutputDir, false, redactionLines(req.Prompt), []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", prompt})
 }
 
 func runCodexResume(ctx context.Context, c config, req taskStatus, answer string) (string, string, error) {
 	prompt := fmt.Sprintf("User answer to your pending question: %s\n\nContinue the original task. If another clarification is required, end your response with exactly two lines: SKILL2API_INPUT_REQUIRED and then a JSON object containing question and optional options.", answer)
-	return runCodexCommand(ctx, c, req.OutputDir, []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", "resume", req.SessionID, prompt})
+	stdout, stderr, _, err := runCodexCommand(ctx, c, req.OutputDir, true, redactionLines(answer), []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", "resume", req.SessionID, prompt})
+	return stdout, stderr, err
 }
 
-func runCodexCommand(ctx context.Context, c config, outputDir string, args []string) (string, string, error) {
+func runCodexCommand(ctx context.Context, c config, outputDir string, appendLogs bool, redactions, args []string) (string, string, string, error) {
+	stdoutOffset, stderrOffset, err := outputLogOffsets(outputDir)
+	if err != nil {
+		return "", "", "", err
+	}
+	if !appendLogs {
+		stdoutOffset, stderrOffset = 0, 0
+	}
+	stdoutLog, stderrLog, err := openOutputLogs(outputDir, appendLogs)
+	if err != nil {
+		return "", "", "", err
+	}
 	cmd := exec.CommandContext(ctx, c.CodexBin, args...)
 	log.Printf("event=skill2api_codex_start output_dir=%s codex_bin=%s timeout=%s", outputDir, c.CodexBin, c.Timeout)
-	stdout, stderr := &limitedBuffer{limit: c.MaxOutput}, &limitedBuffer{limit: c.MaxOutput}
-	cmd.Stdout, cmd.Stderr = stdout, stderr
-	err := cmd.Run()
+	stdoutWriter := &redactingLogWriter{file: stdoutLog, redactions: redactions}
+	stderrWriter := &redactingLogWriter{file: stderrLog, redactions: redactions}
+	cmd.Stdout, cmd.Stderr = stdoutWriter, stderrWriter
+	err = cmd.Run()
+	closeErr := closeOutputLogs(stdoutWriter, stderrWriter)
+	stdout, stdoutErr := readOutputTailSince(filepath.Join(outputDir, stdoutLogName), stdoutOffset, c.MaxOutput)
+	stderr, stderrErr := readOutputTailSince(filepath.Join(outputDir, stderrLogName), stderrOffset, c.MaxOutput)
+	if closeErr != nil {
+		return stdout, stderr, stderrWriter.sessionID, closeErr
+	}
+	if stdoutErr != nil {
+		return stdout, stderr, stderrWriter.sessionID, fmt.Errorf("read %s: %w", stdoutLogName, stdoutErr)
+	}
+	if stderrErr != nil {
+		return stdout, stderr, stderrWriter.sessionID, fmt.Errorf("read %s: %w", stderrLogName, stderrErr)
+	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		log.Printf("event=skill2api_codex_finish result=timeout stdout_bytes=%d stderr_bytes=%d", len(stdout.b), len(stderr.b))
-		return stdout.String(), stderr.String(), fmt.Errorf("codex timed out")
+		log.Printf("event=skill2api_codex_finish result=timeout stdout_bytes=%d stderr_bytes=%d", len(stdout), len(stderr))
+		return stdout, stderr, stderrWriter.sessionID, fmt.Errorf("codex timed out")
 	}
 	if err != nil {
-		log.Printf("event=skill2api_codex_finish result=failed error=%q stdout_bytes=%d stderr_bytes=%d", err, len(stdout.b), len(stderr.b))
-		return stdout.String(), stderr.String(), fmt.Errorf("codex exited: %w", err)
+		log.Printf("event=skill2api_codex_finish result=failed error=%q stdout_bytes=%d stderr_bytes=%d", err, len(stdout), len(stderr))
+		return stdout, stderr, stderrWriter.sessionID, fmt.Errorf("codex exited: %w", err)
 	}
-	log.Printf("event=skill2api_codex_finish result=succeeded stdout_bytes=%d stderr_bytes=%d", len(stdout.b), len(stderr.b))
-	return stdout.String(), stderr.String(), nil
+	log.Printf("event=skill2api_codex_finish result=succeeded stdout_bytes=%d stderr_bytes=%d", len(stdout), len(stderr))
+	return stdout, stderr, stderrWriter.sessionID, nil
 }
 
-type limitedBuffer struct {
-	b         []byte
-	limit     int
-	truncated bool
+func openOutputLogs(outputDir string, appendLogs bool) (*os.File, *os.File, error) {
+	flags := os.O_CREATE | os.O_WRONLY
+	if appendLogs {
+		flags |= os.O_APPEND
+	} else {
+		flags |= os.O_TRUNC
+	}
+	stdout, err := os.OpenFile(filepath.Join(outputDir, stdoutLogName), flags, 0600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open %s: %w", stdoutLogName, err)
+	}
+	stderr, err := os.OpenFile(filepath.Join(outputDir, stderrLogName), flags, 0600)
+	if err != nil {
+		_ = stdout.Close()
+		return nil, nil, fmt.Errorf("open %s: %w", stderrLogName, err)
+	}
+	return stdout, stderr, nil
 }
 
-func (b *limitedBuffer) Write(p []byte) (int, error) {
-	originalLen := len(p)
-	remaining := b.limit - len(b.b)
-	if remaining > 0 {
-		if len(p) > remaining {
-			p = p[:remaining]
-			b.truncated = true
+type redactingLogWriter struct {
+	file       *os.File
+	redactions []string
+	pending    []byte
+	sessionID  string
+}
+
+func redactionLines(value string) []string {
+	var lines []string
+	for _, line := range strings.Split(value, "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
 		}
-		b.b = append(b.b, p...)
-	} else if len(p) > 0 {
-		b.truncated = true
+	}
+	return lines
+}
+
+func (w *redactingLogWriter) Write(p []byte) (int, error) {
+	originalLen := len(p)
+	w.pending = append(w.pending, p...)
+	for {
+		at := bytes.IndexByte(w.pending, '\n')
+		if at < 0 {
+			break
+		}
+		if err := w.writeLine(w.pending[:at+1]); err != nil {
+			return originalLen, err
+		}
+		w.pending = w.pending[at+1:]
 	}
 	return originalLen, nil
 }
-func (b *limitedBuffer) String() string {
-	if b.truncated {
-		return string(b.b) + "\n[output truncated]"
+
+func (w *redactingLogWriter) writeLine(line []byte) error {
+	text := string(line)
+	if sessionID := sessionIDFromStderr(text); sessionID != "" {
+		w.sessionID = sessionID
 	}
-	return string(b.b)
+	for _, redaction := range w.redactions {
+		text = strings.ReplaceAll(text, redaction, "[redacted]")
+	}
+	text = redactSessionID(text)
+	_, err := w.file.WriteString(text)
+	return err
+}
+
+func redactSessionID(text string) string {
+	const marker = "session id:"
+	lower := strings.ToLower(text)
+	at := strings.Index(lower, marker)
+	if at < 0 {
+		return text
+	}
+	suffix := ""
+	if strings.HasSuffix(text, "\n") {
+		suffix = "\n"
+	}
+	return text[:at+len(marker)] + " [redacted]" + suffix
+}
+
+func (w *redactingLogWriter) Close() error {
+	if len(w.pending) > 0 {
+		if err := w.writeLine(w.pending); err != nil {
+			return err
+		}
+		w.pending = nil
+	}
+	return w.file.Close()
+}
+
+func closeOutputLogs(stdout, stderr *redactingLogWriter) error {
+	stdoutErr := stdout.Close()
+	stderrErr := stderr.Close()
+	if stdoutErr != nil {
+		return fmt.Errorf("close %s: %w", stdoutLogName, stdoutErr)
+	}
+	if stderrErr != nil {
+		return fmt.Errorf("close %s: %w", stderrLogName, stderrErr)
+	}
+	return nil
+}
+
+func readOutputTail(path string, limit int) (string, error) {
+	return readOutputTailSince(path, 0, limit)
+}
+
+func outputLogOffsets(outputDir string) (int64, int64, error) {
+	stdout, err := outputLogSize(filepath.Join(outputDir, stdoutLogName))
+	if err != nil {
+		return 0, 0, fmt.Errorf("stat %s: %w", stdoutLogName, err)
+	}
+	stderr, err := outputLogSize(filepath.Join(outputDir, stderrLogName))
+	if err != nil {
+		return 0, 0, fmt.Errorf("stat %s: %w", stderrLogName, err)
+	}
+	return stdout, stderr, nil
+}
+
+func outputLogSize(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+func readOutputTailSince(path string, offset int64, limit int) (string, error) {
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	if offset > info.Size() {
+		offset = info.Size()
+	}
+	start := info.Size() - int64(limit)
+	if start < offset {
+		start = offset
+	}
+	truncated := start > offset
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return "", err
+	}
+	data, err := io.ReadAll(io.LimitReader(file, int64(limit)))
+	if err != nil {
+		return "", err
+	}
+	if truncated {
+		return "[earlier output truncated]\n" + string(data), nil
+	}
+	return string(data), nil
 }
 
 func listFiles(dir string) ([]string, error) {
@@ -553,11 +747,13 @@ func execute(store *statusStore, manager *taskManager, c config, req generateReq
 		log.Printf("event=skill2api_state request_id=%s status=failed error=%q", req.RequestID, v.Error)
 		return
 	}
+	var stdout string
 	skill, err := os.ReadFile(filepath.Join(c.SkillsDir, req.SkillName, "SKILL.md"))
 	if err == nil {
-		v.Stdout, v.Stderr, err = runCodex(ctx, c, req, skill)
+		var sessionID string
+		stdout, _, sessionID, err = runCodexWithSession(ctx, c, req, skill)
 		cancel()
-		v.SessionID = sessionIDFromStderr(v.Stderr)
+		v.SessionID = sessionID
 	}
 	if err != nil {
 		if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
@@ -570,7 +766,7 @@ func execute(store *statusStore, manager *taskManager, c config, req generateReq
 		log.Printf("event=skill2api_state request_id=%s status=failed error=%q", req.RequestID, v.Error)
 		return
 	}
-	if input, needed, parseErr := parseInputRequest(v.Stdout); needed {
+	if input, needed, parseErr := parseInputRequest(stdout); needed {
 		if parseErr != nil || v.SessionID == "" {
 			if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
 				return
@@ -581,24 +777,21 @@ func execute(store *statusStore, manager *taskManager, c config, req generateReq
 			} else {
 				v.Error = "Codex session ID was not found; cannot resume interactive task"
 			}
-		} else {
-			if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
-				return
-			}
-			v.Status = "waiting_for_input"
-			v.Phase = "clarification"
-			v.Question = input.Question
-			v.Options = input.Options
-			v.Error = ""
-			_, _ = store.writeFromRunning(v)
-			log.Printf("event=skill2api_state request_id=%s status=waiting_for_input", req.RequestID)
-			return
-		}
-		if v.Status == "failed" {
 			v.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
 			_, _ = store.writeFromRunning(v)
 			return
 		}
+		if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
+			return
+		}
+		v.Status = "waiting_for_input"
+		v.Phase = "clarification"
+		v.Question = input.Question
+		v.Options = input.Options
+		v.Error = ""
+		_, _ = store.writeFromRunning(v)
+		log.Printf("event=skill2api_state request_id=%s status=waiting_for_input", req.RequestID)
+		return
 	}
 	if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
 		return
@@ -623,7 +816,7 @@ func executeResume(store *statusStore, manager *taskManager, c config, req resum
 		return
 	}
 	var err error
-	v.Stdout, v.Stderr, err = runCodexResume(ctx, c, v, req.Answer)
+	stdout, _, err := runCodexResume(ctx, c, v, req.Answer)
 	cancel()
 	if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
 		return
@@ -632,7 +825,7 @@ func executeResume(store *statusStore, manager *taskManager, c config, req resum
 	if err != nil {
 		v.Status = "failed"
 		v.Error = err.Error()
-	} else if input, needed, parseErr := parseInputRequest(v.Stdout); needed {
+	} else if input, needed, parseErr := parseInputRequest(stdout); needed {
 		if parseErr != nil {
 			v.Status, v.Error = "failed", parseErr.Error()
 		} else {
@@ -687,6 +880,13 @@ func handleGenerate(job periodic.Job, store *statusStore, manager *taskManager, 
 		_ = job.Fail()
 		return
 	}
+	outputDir, err := resolveOutputDir(req.OutputDir, c.OutputRoot)
+	if err != nil {
+		log.Printf("event=skill2api_generate request_id=%s result=validation_failed skill_name=%s output_dir=%s error=%q", req.RequestID, req.SkillName, req.OutputDir, err)
+		_ = job.Fail()
+		return
+	}
+	req.OutputDir = outputDir
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	v := taskStatus{RequestID: req.RequestID, Status: "queued", CreatedAt: now, SkillName: req.SkillName, OutputDir: req.OutputDir}
 	if err := store.create(v, req.Force); err != nil {
@@ -698,7 +898,7 @@ func handleGenerate(job periodic.Job, store *statusStore, manager *taskManager, 
 	doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "queued"})
 	go execute(store, manager, c, req)
 }
-func handleStatus(job periodic.Job, store *statusStore) {
+func handleStatus(job periodic.Job, store *statusStore, c config) {
 	var req statusRequest
 	if strings.TrimSpace(job.Args) != "" {
 		if err := parseArgs(job, &req); err != nil {
@@ -730,7 +930,11 @@ func handleStatus(job periodic.Job, store *statusStore) {
 		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "failed", "error": err.Error()})
 		return
 	}
-	doneJSON(job, publicStatus(v))
+	response, outputErr := statusWithLogOutput(v, c.MaxOutput)
+	if outputErr != nil {
+		log.Printf("event=skill2api_status request_id=%s result=log_read_failed error=%q", req.RequestID, outputErr)
+	}
+	doneJSON(job, response)
 }
 
 func handleResume(job periodic.Job, store *statusStore, manager *taskManager, c config) {
@@ -802,7 +1006,7 @@ func registerWorkerFuncs(worker *periodic.Worker, prefix string, store *statusSt
 	if err := worker.AddFunc(withPrefix(prefix, generateFunc), func(job periodic.Job) { handleGenerate(job, store, manager, c) }); err != nil {
 		return err
 	}
-	if err := worker.AddFunc(withPrefix(prefix, statusFunc), func(job periodic.Job) { handleStatus(job, store) }); err != nil {
+	if err := worker.AddFunc(withPrefix(prefix, statusFunc), func(job periodic.Job) { handleStatus(job, store, c) }); err != nil {
 		return err
 	}
 	if err := worker.AddFunc(withPrefix(prefix, resumeFunc), func(job periodic.Job) { handleResume(job, store, manager, c) }); err != nil {
