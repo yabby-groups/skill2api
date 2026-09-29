@@ -1,0 +1,6 @@
+github.com/Lupino/go-periodic v1.2.0 h1:jRasK2H6gSvfP/p1+owCALhIzJupXvfD3V0JrDd+9jQ=
+github.com/Lupino/go-periodic v1.2.0/go.mod h1:R4tZXtmhdx06QvwnjA4eNlDjsfGg6II0Ds9yFY4DAaQ=
+github.com/gammazero/deque v1.2.1 h1:9fnQVFCCZ9/NOc7ccTNqzoKd1tCWOqeI05/lPqFPMGQ=
+github.com/gammazero/deque v1.2.1/go.mod h1:5nSFkzVm+afG9+gy0VIowlqVAW4N8zNcMne+CMQVD2g=
+github.com/gammazero/workerpool v1.2.1 h1:MEDvUJsNYGuCvl1RwIXNKu2YtQtHqCSF9XWF04N7lqs=
+github.com/gammazero/workerpool v1.2.1/go.mod h1:E32GVRUanF4d6QtRmdss3AScgaDkIyrvPtgRQUWgmx4=
