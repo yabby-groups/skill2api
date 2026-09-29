@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -131,6 +132,24 @@ func TestCodexPromptPreservesCallerPromptAndSkillVerbatim(t *testing.T) {
 	}
 	if strings.Contains(got, "Myna Sanic") || strings.Contains(got, "blueprint package") {
 		t.Fatalf("Codex prompt contains an unrelated task wrapper: %q", got)
+	}
+}
+
+func TestWithoutProxyEnvRemovesProxyVariablesOnly(t *testing.T) {
+	got := withoutProxyEnv([]string{"PATH=/bin", "http_proxy=http://proxy", "HTTPS_PROXY=http://proxy", "ALL_PROXY=socks5://proxy", "NO_PROXY=localhost", "KEEP=value"})
+	if strings.Join(got, "|") != "PATH=/bin|KEEP=value" {
+		t.Fatalf("unexpected direct environment: %#v", got)
+	}
+}
+
+func TestCodexCommandArgsEnablesWorkspaceNetworkOnlyWhenConfigured(t *testing.T) {
+	args := []string{"exec", "--sandbox", "workspace-write", "prompt"}
+	if got := codexCommandArgs(config{}, args); !reflect.DeepEqual(got, args) {
+		t.Fatalf("network-disabled args = %#v, want %#v", got, args)
+	}
+	want := []string{"exec", "-c", "sandbox_workspace_write.network_access=true", "--sandbox", "workspace-write", "prompt"}
+	if got := codexCommandArgs(config{CodexNetworkAccess: true}, args); !reflect.DeepEqual(got, want) {
+		t.Fatalf("network-enabled args = %#v, want %#v", got, want)
 	}
 }
 
@@ -476,6 +495,9 @@ func TestConfigPlainModeUsesPeriodicSettings(t *testing.T) {
 	if c.Timeout != 6*time.Hour {
 		t.Fatalf("default Codex timeout = %s, want %s", c.Timeout, 6*time.Hour)
 	}
+	if c.CodexNoProxy || c.CodexNetworkAccess {
+		t.Fatalf("direct provider settings should default to false: %#v", c)
+	}
 	if withPrefix(c.TaskPrefix, generateFunc) != "generation-skill2api_generate" || statusFunc != "skill2api_status" {
 		t.Fatal("periodic function naming contract changed")
 	}
@@ -492,5 +514,24 @@ func TestConfigCodexTimeoutOverride(t *testing.T) {
 	}
 	if c.Timeout != 8*time.Hour {
 		t.Fatalf("Codex timeout override = %s, want %s", c.Timeout, 8*time.Hour)
+	}
+}
+
+func TestConfigCodexNetworkAccess(t *testing.T) {
+	t.Setenv("PERIODIC_PORT", "tcp://periodic:5000")
+	t.Setenv("PERIODIC_RSA_MODE", "0")
+	t.Setenv("SKILL2API_OUTPUT_ROOT", t.TempDir())
+	t.Setenv("SKILL2API_CODEX_NETWORK_ACCESS", "true")
+	c, err := newConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.CodexNetworkAccess {
+		t.Fatal("network access was not enabled")
+	}
+
+	t.Setenv("SKILL2API_CODEX_NETWORK_ACCESS", "invalid")
+	if _, err := newConfig(); err == nil || !strings.Contains(err.Error(), "SKILL2API_CODEX_NETWORK_ACCESS") {
+		t.Fatalf("invalid network-access setting error = %v", err)
 	}
 }

@@ -78,6 +78,17 @@ execution resumed after an interactive prompt. It defaults to 21600 seconds
 (6 hours), which accommodates long-running video-generation skills. Set it to
 a larger positive number when a deployment needs a longer limit.
 
+## Direct Provider Network
+
+Set `SKILL2API_CODEX_NO_PROXY=true` when Codex skills must reach providers
+directly. The worker then removes `http_proxy`, `https_proxy`, `all_proxy`, and
+`no_proxy` from the Codex subprocess environment. The default is `false`.
+
+Set `SKILL2API_CODEX_NETWORK_ACCESS=true` to allow direct outbound network
+connections from the Codex `workspace-write` sandbox. The worker passes
+`-c sandbox_workspace_write.network_access=true` to Codex while retaining the
+same filesystem sandbox. The default is `false`.
+
 ## Terminate a Job
 
 Terminate a queued, running, or waiting-for-input task with the same request ID:

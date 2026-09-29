@@ -116,14 +116,16 @@ func statusWithLogOutput(v taskStatus, limit int) (statusResponse, error) {
 }
 
 type config struct {
-	PeriodicAddr string
-	TaskPrefix   string
-	RSA          protocol.RSAConnParam
-	OutputRoot   string
-	SkillsDir    string
-	CodexBin     string
-	Timeout      time.Duration
-	MaxOutput    int
+	PeriodicAddr       string
+	TaskPrefix         string
+	RSA                protocol.RSAConnParam
+	OutputRoot         string
+	SkillsDir          string
+	CodexBin           string
+	CodexNoProxy       bool
+	CodexNetworkAccess bool
+	Timeout            time.Duration
+	MaxOutput          int
 }
 
 type statusStore struct {
@@ -192,7 +194,15 @@ func newConfig() (config, error) {
 	if limit < 1024 {
 		limit = 1024
 	}
-	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), Timeout: timeout, MaxOutput: limit}, nil
+	noProxy, err := strconv.ParseBool(firstEnvDefault("SKILL2API_CODEX_NO_PROXY", "false"))
+	if err != nil {
+		return config{}, errors.New("SKILL2API_CODEX_NO_PROXY must be true or false")
+	}
+	networkAccess, err := strconv.ParseBool(firstEnvDefault("SKILL2API_CODEX_NETWORK_ACCESS", "false"))
+	if err != nil {
+		return config{}, errors.New("SKILL2API_CODEX_NETWORK_ACCESS must be true or false")
+	}
+	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexNoProxy: noProxy, CodexNetworkAccess: networkAccess, Timeout: timeout, MaxOutput: limit}, nil
 }
 func firstEnvDefault(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -584,7 +594,10 @@ func runCodexCommand(ctx context.Context, c config, outputDir string, appendLogs
 	if err != nil {
 		return "", "", "", err
 	}
-	cmd := exec.CommandContext(ctx, c.CodexBin, args...)
+	cmd := exec.CommandContext(ctx, c.CodexBin, codexCommandArgs(c, args)...)
+	if c.CodexNoProxy {
+		cmd.Env = withoutProxyEnv(os.Environ())
+	}
 	log.Printf("event=skill2api_codex_start output_dir=%s codex_bin=%s timeout=%s", outputDir, c.CodexBin, c.Timeout)
 	stdoutWriter := &redactingLogWriter{file: stdoutLog, redactions: redactions}
 	stderrWriter := &redactingLogWriter{file: stderrLog, redactions: redactions, onSessionID: onSessionID}
@@ -612,6 +625,28 @@ func runCodexCommand(ctx context.Context, c config, outputDir string, appendLogs
 	}
 	log.Printf("event=skill2api_codex_finish result=succeeded stdout_bytes=%d stderr_bytes=%d", len(stdout), len(stderr))
 	return stdout, stderr, stderrWriter.sessionID, nil
+}
+
+func withoutProxyEnv(environ []string) []string {
+	filtered := make([]string, 0, len(environ))
+	for _, value := range environ {
+		key, _, _ := strings.Cut(value, "=")
+		switch strings.ToLower(key) {
+		case "http_proxy", "https_proxy", "all_proxy", "no_proxy":
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	return filtered
+}
+
+func codexCommandArgs(c config, args []string) []string {
+	if !c.CodexNetworkAccess || len(args) == 0 {
+		return args
+	}
+	withNetworkAccess := make([]string, 0, len(args)+2)
+	withNetworkAccess = append(withNetworkAccess, args[0], "-c", "sandbox_workspace_write.network_access=true")
+	return append(withNetworkAccess, args[1:]...)
 }
 
 func openOutputLogs(outputDir string, appendLogs bool) (*os.File, *os.File, error) {
