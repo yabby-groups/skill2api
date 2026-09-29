@@ -45,8 +45,9 @@ type statusRequest struct {
 }
 
 type resumeRequest struct {
-	RequestID string `json:"request_id"`
-	Answer    string `json:"answer"`
+	RequestID   string `json:"request_id"`
+	Answer      string `json:"answer"`
+	Instruction string `json:"instruction"`
 }
 
 type terminateRequest struct {
@@ -278,7 +279,7 @@ func (s *statusStore) create(v taskStatus, force bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing, err := s.readUnlocked(v.RequestID); err == nil {
-		if !force || existing.Status == "queued" || existing.Status == "running" {
+		if !force || existing.Status == "queued" || existing.Status == "running" || existing.Status == "interrupted" {
 			return errors.New("request_id already exists")
 		}
 	}
@@ -301,6 +302,61 @@ func (s *statusStore) claimWaiting(id string) (taskStatus, error) {
 		return taskStatus{}, err
 	}
 	return v, nil
+}
+
+func (s *statusStore) claimInterrupted(id string) (taskStatus, error) {
+	return s.claimContinuation(id, "interrupted")
+}
+
+func (s *statusStore) claimSucceeded(id string) (taskStatus, error) {
+	return s.claimContinuation(id, "succeeded")
+}
+
+func (s *statusStore) claimFailed(id string) (taskStatus, error) {
+	return s.claimContinuation(id, "failed")
+}
+
+func (s *statusStore) claimTerminated(id string) (taskStatus, error) {
+	return s.claimContinuation(id, "terminated")
+}
+
+func (s *statusStore) claimContinuation(id, expectedStatus string) (taskStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, err := s.readUnlocked(id)
+	if err != nil {
+		return taskStatus{}, err
+	}
+	if v.Status != expectedStatus {
+		return v, fmt.Errorf("request is not %s", expectedStatus)
+	}
+	if v.SessionID == "" {
+		return v, errors.New("Codex session ID is missing")
+	}
+	v.Status = "running"
+	v.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	v.FinishedAt, v.Error, v.Question, v.Options, v.Phase, v.Stdout, v.Stderr = "", "", "", nil, "", "", ""
+	if err := s.writeUnlocked(v); err != nil {
+		return taskStatus{}, err
+	}
+	return v, nil
+}
+
+func (s *statusStore) updateSessionID(id, startedAt, sessionID string) error {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, err := s.readUnlocked(id)
+	if err != nil {
+		return err
+	}
+	if v.Status != "running" || v.StartedAt != startedAt {
+		return nil
+	}
+	v.SessionID = sessionID
+	return s.writeUnlocked(v)
 }
 
 func (s *statusStore) claimQueued(id string) (taskStatus, error) {
@@ -431,10 +487,15 @@ func (s *statusStore) recoverRunning() error {
 		if err != nil || v.Status != "running" {
 			continue
 		}
-		v.Status = "failed"
-		v.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
 		v.Error = "worker interrupted"
-		log.Printf("event=skill2api_recover request_id=%s status=failed error=%q", v.RequestID, v.Error)
+		if v.SessionID != "" {
+			v.Status = "interrupted"
+			v.FinishedAt = ""
+		} else {
+			v.Status = "failed"
+			v.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		}
+		log.Printf("event=skill2api_recover request_id=%s status=%s error=%q", v.RequestID, v.Status, v.Error)
 		if err := s.write(v); err != nil {
 			return err
 		}
@@ -485,17 +546,29 @@ func runCodex(ctx context.Context, c config, req generateRequest, skill []byte) 
 }
 
 func runCodexWithSession(ctx context.Context, c config, req generateRequest, skill []byte) (string, string, string, error) {
-	prompt := fmt.Sprintf("%s\n\nUse the skill instructions below to implement the request as a reviewable Myna Sanic blueprint package. Write the blueprint, route entry, dependency notes, and README into the current working directory (%s). Do not modify files outside that directory.\n\nIf you need user information before continuing, do not guess. End your response with exactly two lines: SKILL2API_INPUT_REQUIRED and then a JSON object containing question and optional options.\n\nSkill instructions:\n%s", req.Prompt, req.OutputDir, string(skill))
-	return runCodexCommand(ctx, c, req.OutputDir, false, redactionLines(req.Prompt), []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", prompt})
+	return runCodexWithSessionCallback(ctx, c, req, skill, nil)
 }
 
-func runCodexResume(ctx context.Context, c config, req taskStatus, answer string) (string, string, error) {
-	prompt := fmt.Sprintf("User answer to your pending question: %s\n\nContinue the original task. If another clarification is required, end your response with exactly two lines: SKILL2API_INPUT_REQUIRED and then a JSON object containing question and optional options.", answer)
-	stdout, stderr, _, err := runCodexCommand(ctx, c, req.OutputDir, true, redactionLines(answer), []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", "resume", req.SessionID, prompt})
+func runCodexWithSessionCallback(ctx context.Context, c config, req generateRequest, skill []byte, onSessionID func(string)) (string, string, string, error) {
+	prompt := fmt.Sprintf("%s\n\nUse the skill instructions below to implement the request as a reviewable Myna Sanic blueprint package. Write the blueprint, route entry, dependency notes, and README into the current working directory (%s). Do not modify files outside that directory.\n\nIf you need user information before continuing, do not guess. End your response with exactly two lines: SKILL2API_INPUT_REQUIRED and then a JSON object containing question and optional options.\n\nSkill instructions:\n%s", req.Prompt, req.OutputDir, string(skill))
+	return runCodexCommand(ctx, c, req.OutputDir, false, redactionLines(req.Prompt), onSessionID, []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", prompt})
+}
+
+func runCodexResume(ctx context.Context, c config, req taskStatus, answer, instruction string) (string, string, error) {
+	prompt := "Continue the original task."
+	if strings.TrimSpace(answer) != "" {
+		prompt = fmt.Sprintf("User answer to your pending question: %s\n\nContinue the original task.", answer)
+	}
+	if strings.TrimSpace(instruction) != "" {
+		prompt += fmt.Sprintf("\n\nAdditional user instruction: %s", instruction)
+	}
+	prompt += "\n\nIf another clarification is required, end your response with exactly two lines: SKILL2API_INPUT_REQUIRED and then a JSON object containing question and optional options."
+	redactions := append(redactionLines(answer), redactionLines(instruction)...)
+	stdout, stderr, _, err := runCodexCommand(ctx, c, req.OutputDir, true, redactions, nil, []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", "resume", req.SessionID, prompt})
 	return stdout, stderr, err
 }
 
-func runCodexCommand(ctx context.Context, c config, outputDir string, appendLogs bool, redactions, args []string) (string, string, string, error) {
+func runCodexCommand(ctx context.Context, c config, outputDir string, appendLogs bool, redactions []string, onSessionID func(string), args []string) (string, string, string, error) {
 	stdoutOffset, stderrOffset, err := outputLogOffsets(outputDir)
 	if err != nil {
 		return "", "", "", err
@@ -510,7 +583,7 @@ func runCodexCommand(ctx context.Context, c config, outputDir string, appendLogs
 	cmd := exec.CommandContext(ctx, c.CodexBin, args...)
 	log.Printf("event=skill2api_codex_start output_dir=%s codex_bin=%s timeout=%s", outputDir, c.CodexBin, c.Timeout)
 	stdoutWriter := &redactingLogWriter{file: stdoutLog, redactions: redactions}
-	stderrWriter := &redactingLogWriter{file: stderrLog, redactions: redactions}
+	stderrWriter := &redactingLogWriter{file: stderrLog, redactions: redactions, onSessionID: onSessionID}
 	cmd.Stdout, cmd.Stderr = stdoutWriter, stderrWriter
 	err = cmd.Run()
 	closeErr := closeOutputLogs(stdoutWriter, stderrWriter)
@@ -557,10 +630,11 @@ func openOutputLogs(outputDir string, appendLogs bool) (*os.File, *os.File, erro
 }
 
 type redactingLogWriter struct {
-	file       *os.File
-	redactions []string
-	pending    []byte
-	sessionID  string
+	file        *os.File
+	redactions  []string
+	pending     []byte
+	sessionID   string
+	onSessionID func(string)
 }
 
 func redactionLines(value string) []string {
@@ -593,6 +667,9 @@ func (w *redactingLogWriter) writeLine(line []byte) error {
 	text := string(line)
 	if sessionID := sessionIDFromStderr(text); sessionID != "" {
 		w.sessionID = sessionID
+		if w.onSessionID != nil {
+			w.onSessionID(sessionID)
+		}
 	}
 	for _, redaction := range w.redactions {
 		text = strings.ReplaceAll(text, redaction, "[redacted]")
@@ -751,7 +828,11 @@ func execute(store *statusStore, manager *taskManager, c config, req generateReq
 	skill, err := os.ReadFile(filepath.Join(c.SkillsDir, req.SkillName, "SKILL.md"))
 	if err == nil {
 		var sessionID string
-		stdout, _, sessionID, err = runCodexWithSession(ctx, c, req, skill)
+		stdout, _, sessionID, err = runCodexWithSessionCallback(ctx, c, req, skill, func(sessionID string) {
+			if updateErr := store.updateSessionID(req.RequestID, v.StartedAt, sessionID); updateErr != nil {
+				log.Printf("event=skill2api_session request_id=%s result=persist_failed error=%q", req.RequestID, updateErr)
+			}
+		})
 		cancel()
 		v.SessionID = sessionID
 	}
@@ -816,7 +897,7 @@ func executeResume(store *statusStore, manager *taskManager, c config, req resum
 		return
 	}
 	var err error
-	stdout, _, err := runCodexResume(ctx, c, v, req.Answer)
+	stdout, _, err := runCodexResume(ctx, c, v, req.Answer, req.Instruction)
 	cancel()
 	if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
 		return
@@ -939,7 +1020,19 @@ func handleStatus(job periodic.Job, store *statusStore, c config) {
 
 func handleResume(job periodic.Job, store *statusStore, manager *taskManager, c config) {
 	var req resumeRequest
-	if err := parseArgs(job, &req); err != nil || !validID(req.RequestID) || strings.TrimSpace(req.Answer) == "" {
+	if strings.TrimSpace(job.Args) != "" {
+		if err := parseArgs(job, &req); err != nil {
+			_ = job.Fail()
+			return
+		}
+	}
+	if strings.TrimSpace(req.RequestID) == "" {
+		req.RequestID = job.Name
+	} else if req.RequestID != job.Name {
+		_ = job.Fail()
+		return
+	}
+	if !validID(req.RequestID) || (strings.TrimSpace(req.Answer) != "" && strings.TrimSpace(req.Instruction) != "") {
 		_ = job.Fail()
 		return
 	}
@@ -948,11 +1041,40 @@ func handleResume(job periodic.Job, store *statusStore, manager *taskManager, c 
 		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "not_found", "error": "request not found"})
 		return
 	}
-	if v.Status != "waiting_for_input" {
-		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": v.Status, "error": "request is not waiting for input"})
+	if v.Status == "waiting_for_input" {
+		if strings.TrimSpace(req.Answer) == "" {
+			doneJSON(job, map[string]any{"request_id": req.RequestID, "status": v.Status, "error": "answer is required while waiting for input"})
+			return
+		}
+		v, err = store.claimWaiting(req.RequestID)
+	} else if v.Status == "interrupted" {
+		if strings.TrimSpace(req.Answer) != "" {
+			doneJSON(job, map[string]any{"request_id": req.RequestID, "status": v.Status, "error": "answer is only valid while waiting for input"})
+			return
+		}
+		v, err = store.claimInterrupted(req.RequestID)
+	} else if v.Status == "succeeded" {
+		if strings.TrimSpace(req.Instruction) == "" {
+			doneJSON(job, map[string]any{"request_id": req.RequestID, "status": v.Status, "error": "instruction is required for a completed request"})
+			return
+		}
+		v, err = store.claimSucceeded(req.RequestID)
+	} else if v.Status == "failed" {
+		if strings.TrimSpace(req.Answer) != "" {
+			doneJSON(job, map[string]any{"request_id": req.RequestID, "status": v.Status, "error": "answer is only valid while waiting for input"})
+			return
+		}
+		v, err = store.claimFailed(req.RequestID)
+	} else if v.Status == "terminated" {
+		if strings.TrimSpace(req.Answer) != "" {
+			doneJSON(job, map[string]any{"request_id": req.RequestID, "status": v.Status, "error": "answer is only valid while waiting for input"})
+			return
+		}
+		v, err = store.claimTerminated(req.RequestID)
+	} else {
+		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": v.Status, "error": "request is not resumable"})
 		return
 	}
-	v, err = store.claimWaiting(req.RequestID)
 	if err != nil {
 		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "conflict", "error": err.Error()})
 		return

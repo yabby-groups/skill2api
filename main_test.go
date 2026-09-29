@@ -64,6 +64,45 @@ func TestStatusStoreAtomicWriteAndRecovery(t *testing.T) {
 	if got.Status != "failed" || got.Error != "worker interrupted" || got.FinishedAt == "" {
 		t.Fatalf("unexpected recovered status: %#v", got)
 	}
+	if err := store.write(taskStatus{RequestID: "r2", Status: "running", StartedAt: "started", SessionID: "session-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.recoverRunning(); err != nil {
+		t.Fatal(err)
+	}
+	resumable, err := store.read("r2")
+	if err != nil || resumable.Status != "interrupted" || resumable.Error != "worker interrupted" || resumable.FinishedAt != "" {
+		t.Fatalf("unexpected resumable status: %#v err=%v", resumable, err)
+	}
+	if err := store.create(taskStatus{RequestID: "r2", Status: "queued"}, true); err == nil {
+		t.Fatal("force replaced an interrupted request")
+	}
+	claimed, err := store.claimInterrupted("r2")
+	if err != nil || claimed.Status != "running" || claimed.StartedAt == "started" {
+		t.Fatalf("interrupted request was not claimed: %#v err=%v", claimed, err)
+	}
+	if err := store.write(taskStatus{RequestID: "r3", Status: "succeeded", StartedAt: "completed-attempt", FinishedAt: "finished", SessionID: "session-3"}); err != nil {
+		t.Fatal(err)
+	}
+	continued, err := store.claimSucceeded("r3")
+	if err != nil || continued.Status != "running" || continued.StartedAt == "completed-attempt" || continued.FinishedAt != "" || continued.SessionID != "session-3" {
+		t.Fatalf("completed request was not claimed for continuation: %#v err=%v", continued, err)
+	}
+	for _, state := range []string{"failed", "terminated"} {
+		id := "r-" + state
+		if err := store.write(taskStatus{RequestID: id, Status: state, StartedAt: "previous", FinishedAt: "finished", SessionID: "session-" + state}); err != nil {
+			t.Fatal(err)
+		}
+		var resumed taskStatus
+		if state == "failed" {
+			resumed, err = store.claimFailed(id)
+		} else {
+			resumed, err = store.claimTerminated(id)
+		}
+		if err != nil || resumed.Status != "running" || resumed.FinishedAt != "" || resumed.SessionID == "" {
+			t.Fatalf("%s request was not claimed for continuation: %#v err=%v", state, resumed, err)
+		}
+	}
 	if err := store.create(taskStatus{RequestID: "r1", Status: "queued"}, false); err == nil {
 		t.Fatal("duplicate request was accepted")
 	}
@@ -93,6 +132,27 @@ func TestClaimWaitingIsAtomic(t *testing.T) {
 	}
 	if _, err := store.claimWaiting("r1"); err == nil {
 		t.Fatal("waiting request was claimed twice")
+	}
+}
+
+func TestUpdateSessionIDOnlyUpdatesCurrentRun(t *testing.T) {
+	store := &statusStore{root: t.TempDir()}
+	if err := store.write(taskStatus{RequestID: "r1", Status: "running", StartedAt: "attempt-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.updateSessionID("r1", "attempt-1", "session-1"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.read("r1")
+	if err != nil || got.SessionID != "session-1" {
+		t.Fatalf("session ID was not persisted: %#v err=%v", got, err)
+	}
+	if err := store.updateSessionID("r1", "another-attempt", "session-2"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.read("r1")
+	if err != nil || got.SessionID != "session-1" {
+		t.Fatalf("stale execution overwrote session: %#v err=%v", got, err)
 	}
 }
 
@@ -228,7 +288,7 @@ func TestRunCodexResumeAppendsLogs(t *testing.T) {
 	if _, _, err := runCodex(context.Background(), c, generateRequest{OutputDir: out}, nil); err != nil {
 		t.Fatal(err)
 	}
-	stdoutTail, stderrTail, err := runCodexResume(context.Background(), c, taskStatus{OutputDir: out, SessionID: "session-1"}, "answer")
+	stdoutTail, stderrTail, err := runCodexResume(context.Background(), c, taskStatus{OutputDir: out, SessionID: "session-1"}, "answer", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,10 +342,42 @@ func TestRunCodexWritesLogsBeforeCompletion(t *testing.T) {
 	}
 }
 
+func TestRunCodexPersistsSessionBeforeCompletion(t *testing.T) {
+	c, root := testConfig(t)
+	bin := filepath.Join(root, "fake-codex")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf 'session id: session-1\\n' >&2\nsleep 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c.CodexBin = bin
+	out := filepath.Join(root, "request-1")
+	if err := os.MkdirAll(out, 0750); err != nil {
+		t.Fatal(err)
+	}
+	sessions := make(chan string, 1)
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := runCodexWithSessionCallback(context.Background(), c, generateRequest{OutputDir: out}, nil, func(id string) { sessions <- id })
+		done <- err
+	}()
+	select {
+	case id := <-sessions:
+		if id != "session-1" {
+			t.Fatalf("unexpected session ID: %q", id)
+		}
+	case err := <-done:
+		t.Fatalf("Codex completed before session persistence: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("session ID was not reported while Codex ran")
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRunCodexRedactsPromptAndResumeAnswerFromLogs(t *testing.T) {
 	c, root := testConfig(t)
 	bin := filepath.Join(root, "fake-codex")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf 'keep this output'\ncase \"$*\" in *resume*) printf 'secret answer value' >&2 ;; *) printf 'secret prompt value' >&2 ;; esac\nprintf '\\nsession id: private-session-1\\n' >&2\n"), 0700); err != nil {
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf 'keep this output'\ncase \"$*\" in *resume*) printf 'secret answer value\\nsecret instruction value' >&2 ;; *) printf 'secret prompt value' >&2 ;; esac\nprintf '\\nsession id: private-session-1\\n' >&2\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	c.CodexBin = bin
@@ -298,7 +390,7 @@ func TestRunCodexRedactsPromptAndResumeAnswerFromLogs(t *testing.T) {
 	} else if sessionID != "private-session-1" {
 		t.Fatalf("unexpected private session ID: %q", sessionID)
 	}
-	if _, _, err := runCodexResume(context.Background(), c, taskStatus{OutputDir: out, SessionID: "session-1"}, "secret answer value"); err != nil {
+	if _, _, err := runCodexResume(context.Background(), c, taskStatus{OutputDir: out, SessionID: "session-1"}, "secret answer value", "secret instruction value"); err != nil {
 		t.Fatal(err)
 	}
 	stdout, err := os.ReadFile(filepath.Join(out, stdoutLogName))
@@ -309,10 +401,10 @@ func TestRunCodexRedactsPromptAndResumeAnswerFromLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(stderr), "secret prompt value") || strings.Contains(string(stderr), "secret answer value") || strings.Contains(string(stderr), "private-session-1") {
+	if strings.Contains(string(stderr), "secret prompt value") || strings.Contains(string(stderr), "secret answer value") || strings.Contains(string(stderr), "secret instruction value") || strings.Contains(string(stderr), "private-session-1") {
 		t.Fatalf("sensitive input was written to stderr log: %q", stderr)
 	}
-	if strings.Count(string(stderr), "[redacted]") != 4 {
+	if strings.Count(string(stderr), "[redacted]") != 5 {
 		t.Fatalf("expected inputs and session IDs to be redacted: %q", stderr)
 	}
 }

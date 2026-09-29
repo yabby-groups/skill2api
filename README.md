@@ -48,6 +48,7 @@ job name. The normal states are:
 | --- | --- |
 | `queued` | The job was created and is waiting to run. |
 | `running` | Codex is executing the skill. |
+| `interrupted` | Worker restarted after saving the Codex session; it can be resumed. |
 | `waiting_for_input` | The skill asked a question and is waiting for an answer. |
 | `succeeded` | The task completed; `files` lists the generated files. |
 | `failed` | Execution failed; inspect `error`, `stdout`, and `stderr`. |
@@ -110,11 +111,29 @@ SKILL2API_INPUT_REQUIRED
 ```
 
 The caller can render `options` as buttons or a select control, then submit the
-selected value:
+selected value. The same `skill2api_resume` endpoint also restores an
+`interrupted` request after a worker restart.
 
 ```bash
 periodic run skill2api_resume request-1 \
   --workload '{"request_id":"request-1","answer":"v2"}' \
+  --timeout 30
+```
+
+To continue an interrupted task without adding instructions, omit both `answer`
+and `instruction`:
+
+```bash
+periodic run skill2api_resume request-1 --timeout 30
+```
+
+To continue an interrupted or completed task with a follow-up instruction that
+may add or modify files in the existing output directory, send `instruction`
+instead. A completed task requires a non-empty instruction:
+
+```bash
+periodic run skill2api_resume request-1 \
+  --workload '{"request_id":"request-1","instruction":"Add error handling and update README."}' \
   --timeout 30
 ```
 
@@ -142,10 +161,14 @@ persisted but is never returned by the status function.
 ## Restart, Duplicate, and Failure Handling
 
 - A `waiting_for_input` job survives a worker restart and can be resumed.
-- A job interrupted while `running` is marked `failed` with
-  `worker interrupted`.
-- A job can only be resumed from `waiting_for_input`; duplicate resume requests
-  return a conflict.
+- A running job with a saved Codex session is marked `interrupted` after a
+  worker restart and can be resumed through `skill2api_resume`. A job whose
+  session ID was not yet saved is marked `failed` with `worker interrupted`.
+- `skill2api_resume` requires `answer` for `waiting_for_input`; for
+  `interrupted`, `failed`, and `terminated`, `instruction` is optional. A
+  `succeeded` task can be resumed only with a non-empty `instruction`. Do not
+  provide both fields in one request. Duplicate resume requests return a
+  conflict. Any resumed task requires a saved Codex session ID.
 - The backend currently does not enforce that `answer` belongs to `options`.
   The caller should constrain the UI selection, and the skill should validate
   the answer after resuming.
@@ -153,4 +176,7 @@ persisted but is never returned by the status function.
   `SKILL2API_OUTPUT_ROOT/<request_id>/status.json`. Generated files, the status
   file, and `stdout.log`/`stderr.log` are kept in the job's `output_dir`.
 - A resumed task appends to its existing log files. A new generation or a
-  `force` rerun truncates them before Codex starts.
+  `force` rerun truncates them before Codex starts. A failed or terminated task
+  without a saved session ID cannot be resumed and needs a deliberate `force`
+  rerun. If Codex cannot restore a saved session, the task becomes `failed`;
+  generated files and logs remain for inspection.
