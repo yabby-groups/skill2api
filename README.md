@@ -8,7 +8,7 @@ user decision.
 
 - The Periodic service is running.
 - The Skill2API worker registers `skill2api_generate`, `skill2api_status`,
-  `skill2api_resume`, and `skill2api_terminate`.
+  `skill2api_resume`, `skill2api_terminate`, and `skill2api_cleanup`.
 - `skill_name` resolves to `SKILL2API_SKILLS_DIR/<skill_name>/SKILL.md`.
 - `output_dir` is a relative path inside `SKILL2API_OUTPUT_ROOT`.
 
@@ -144,6 +144,26 @@ The response is terminal and the task can no longer be resumed:
 For a running task, the worker cancels the Codex process. Generated files are
 kept; termination only updates the task state.
 
+## Cleanup Expired Tasks
+
+Skill2API submits this function before each `generate` or `resume` execution.
+It is delayed for 24 hours, and its Periodic job name is the canonical request
+ID. It can also be invoked manually for one request:
+
+```bash
+periodic run skill2api_cleanup request-1 --timeout 30
+```
+
+It deletes `succeeded`, `failed`, and `terminated` tasks, including
+`status.json`, logs, generated files, and the private per-request Codex home
+containing the resumable session. If the task is still active when cleanup runs,
+the cleanup job uses `SchedLater(86400)` and checks again one day later.
+
+Cleanup only deletes the documented dedicated layout where `output_dir` equals
+`request_id`. Custom output directories are skipped to avoid deleting shared
+data. The response contains the `request_id` and a status of `deleted`,
+`not_due`, `deferred`, `skipped`, `not_found`, or `failed`.
+
 ## Interactive Protocol
 
 When a skill needs user information, it must end its response with these two
@@ -236,3 +256,6 @@ persisted but is never returned by the status function.
   without a saved session ID cannot be resumed and needs a deliberate `force`
   rerun. If Codex cannot restore a saved session, the task becomes `failed`;
   generated files and logs remain for inspection.
+- Native and Docker Codex runs both use a private per-request home under
+  `SKILL2API_OUTPUT_ROOT/.skill2api-codex/<request_id>/home`. It retains the
+  Codex session until cleanup and is never exposed through task status.

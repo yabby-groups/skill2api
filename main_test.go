@@ -239,6 +239,111 @@ func TestDockerCodexHomesAreIsolatedPerRequest(t *testing.T) {
 	}
 }
 
+func TestNativeCodexHomeIsPrivatePerRequest(t *testing.T) {
+	c, root := testConfig(t)
+	outputDir := filepath.Join(root, "request-1")
+	if err := os.MkdirAll(outputDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	cmd, _, err := newCodexCommand(context.Background(), c, "request-1", outputDir, map[string]string{"HOME": "ignored"}, []string{"exec"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(cmd.Env, "\n"), "HOME="+codexHomeDir(c, "request-1")) {
+		t.Fatalf("native command did not use private home: %#v", cmd.Env)
+	}
+	if _, err := os.Stat(codexHomeDir(c, "request-1")); err != nil {
+		t.Fatalf("native private home was not created: %v", err)
+	}
+}
+
+func TestCleanupRemovesOnlyNamedExpiredDedicatedTaskDataAndSessions(t *testing.T) {
+	c, root := testConfig(t)
+	store := &statusStore{root: root}
+	now := time.Date(2026, time.September, 30, 12, 0, 0, 0, time.UTC)
+	expired := filepath.Join(root, "expired")
+	if err := os.MkdirAll(expired, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(expired, "artifact.txt"), []byte("artifact"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(codexHomeDir(c, "expired"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.write(taskStatus{RequestID: "expired", Status: "succeeded", FinishedAt: now.Add(-retentionAge).Format(time.RFC3339Nano), OutputDir: expired}); err != nil {
+		t.Fatal(err)
+	}
+	otherExpired := filepath.Join(root, "other-expired")
+	if err := os.MkdirAll(otherExpired, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.write(taskStatus{RequestID: "other-expired", Status: "failed", FinishedAt: now.Add(-retentionAge).Format(time.RFC3339Nano), OutputDir: otherExpired}); err != nil {
+		t.Fatal(err)
+	}
+
+	resumed := filepath.Join(root, "resumed")
+	if err := store.write(taskStatus{RequestID: "resumed", Status: "succeeded", FinishedAt: now.Add(-retentionAge).Format(time.RFC3339Nano), OutputDir: resumed, SessionID: "session-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(resumed, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if resumedStatus, err := store.claimSucceeded("resumed"); err != nil || resumedStatus.Status != "running" || resumedStatus.FinishedAt != "" {
+		t.Fatalf("resumed task did not reset retention window: %#v err=%v", resumedStatus, err)
+	}
+	custom := filepath.Join(root, "custom-output")
+	if err := os.MkdirAll(custom, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.write(taskStatus{RequestID: "custom", Status: "failed", FinishedAt: now.Add(-retentionAge).Format(time.RFC3339Nano), OutputDir: custom}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := store.cleanup(c, "expired", now)
+	if got.Status != "deleted" || got.RequestID != "expired" {
+		t.Fatalf("cleanup result = %#v", got)
+	}
+	for _, path := range []string{expired, filepath.Dir(codexHomeDir(c, "expired"))} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("expired task data remains at %s: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(resumed); err != nil {
+		t.Fatalf("resumed task was removed: %v", err)
+	}
+	if _, err := os.Stat(otherExpired); err != nil {
+		t.Fatalf("unrelated expired task was removed: %v", err)
+	}
+	if _, err := os.Stat(custom); err != nil {
+		t.Fatalf("custom output was removed: %v", err)
+	}
+	if got := store.cleanup(c, "resumed", now); got.Status != "deferred" {
+		t.Fatalf("resumed task cleanup result = %#v", got)
+	}
+	if got := store.cleanup(c, "custom", now); got.Status != "skipped" {
+		t.Fatalf("custom task cleanup result = %#v", got)
+	}
+}
+
+func TestSubmitCleanupAtUsesRequestIDAndTerminalRetention(t *testing.T) {
+	c, _ := testConfig(t)
+	c.TaskPrefix = "generation-"
+	finishedAt := time.Date(2026, time.September, 30, 12, 0, 0, 0, time.UTC)
+	var gotFunc, gotName string
+	var gotOptions map[string]interface{}
+	err := submitCleanupAt(func(funcName, name string, options map[string]interface{}) error {
+		gotFunc, gotName, gotOptions = funcName, name, options
+		return nil
+	}, c, "request-1", finishedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotFunc != "generation-skill2api_cleanup" || gotName != "request-1" || gotOptions["schedat"] != finishedAt.Add(retentionAge).Unix() {
+		t.Fatalf("cleanup schedule = func=%q name=%q options=%#v", gotFunc, gotName, gotOptions)
+	}
+}
+
 func TestEnvironmentValuesAreRedacted(t *testing.T) {
 	got := environmentRedactions(map[string]string{"TOKEN": "first\nsecond", "EMPTY": "", "PREFIX": "first-value"})
 	if !reflect.DeepEqual(got, []string{"first-value", "second", "first"}) {
@@ -630,7 +735,7 @@ func TestConfigPlainModeUsesPeriodicSettings(t *testing.T) {
 	if c.CodexNoProxy || c.CodexNetworkAccess || c.CodexDocker || c.CodexDockerBin != "docker" || c.CodexDockerImage != "lupino/sandbox-runner:latest" {
 		t.Fatalf("direct provider settings should default to false: %#v", c)
 	}
-	if withPrefix(c.TaskPrefix, generateFunc) != "generation-skill2api_generate" || statusFunc != "skill2api_status" {
+	if withPrefix(c.TaskPrefix, generateFunc) != "generation-skill2api_generate" || statusFunc != "skill2api_status" || cleanupFunc != "skill2api_cleanup" {
 		t.Fatal("periodic function naming contract changed")
 	}
 }

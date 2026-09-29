@@ -26,8 +26,10 @@ const (
 	statusFunc    = "skill2api_status"
 	resumeFunc    = "skill2api_resume"
 	terminateFunc = "skill2api_terminate"
+	cleanupFunc   = "skill2api_cleanup"
 	maxOutput     = 64 * 1024
 	maxSkillName  = 128
+	retentionAge  = 24 * time.Hour
 	stdoutLogName = "stdout.log"
 	stderrLogName = "stderr.log"
 )
@@ -55,6 +57,12 @@ type resumeRequest struct {
 
 type terminateRequest struct {
 	RequestID string `json:"request_id"`
+}
+
+type cleanupResponse struct {
+	RequestID string `json:"request_id"`
+	Status    string `json:"status"`
+	Error     string `json:"error,omitempty"`
 }
 
 type taskStatus struct {
@@ -434,6 +442,78 @@ func (s *statusStore) terminate(id string) (taskStatus, error) {
 	return v, nil
 }
 
+func terminalStatus(status string) bool {
+	return status == "succeeded" || status == "failed" || status == "terminated"
+}
+
+type cleanupSubmitter func(string, string, map[string]interface{}) error
+
+func submitCleanupAt(submit cleanupSubmitter, c config, requestID string, startedAt time.Time) error {
+	return submit(withPrefix(c.TaskPrefix, cleanupFunc), requestID, map[string]interface{}{
+		"schedat": startedAt.Add(retentionAge).Unix(),
+	})
+}
+
+func scheduleCleanup(c config, requestID string) {
+	client := periodic.NewClient()
+	if err := connectPeriodic(client, c.PeriodicAddr, c.RSA); err != nil {
+		log.Printf("event=skill2api_cleanup request_id=%s result=schedule_connect_failed error=%q", requestID, err)
+		return
+	}
+	defer client.Close()
+	if err := submitCleanupAt(client.SubmitJob, c, requestID, time.Now().UTC()); err != nil {
+		log.Printf("event=skill2api_cleanup request_id=%s result=schedule_failed error=%q", requestID, err)
+		return
+	}
+	log.Printf("event=skill2api_cleanup request_id=%s result=scheduled", requestID)
+}
+
+func (s *statusStore) cleanup(c config, id string, now time.Time) cleanupResponse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result := cleanupResponse{RequestID: id}
+	v, err := s.readUnlocked(id)
+	if errors.Is(err, os.ErrNotExist) {
+		result.Status, result.Error = "not_found", "request not found"
+		return result
+	}
+	if err != nil || v.RequestID != id {
+		result.Status, result.Error = "failed", "invalid task status"
+		return result
+	}
+	if !terminalStatus(v.Status) {
+		result.Status, result.Error = "deferred", "request is not terminal"
+		return result
+	}
+	finishedAt, err := time.Parse(time.RFC3339Nano, v.FinishedAt)
+	if err != nil {
+		result.Status, result.Error = "not_due", "request has no valid completion time"
+		return result
+	}
+	if finishedAt.Add(retentionAge).After(now) {
+		result.Status, result.Error = "not_due", "retention period has not elapsed"
+		return result
+	}
+	if filepath.Clean(v.OutputDir) != filepath.Join(s.root, id) {
+		result.Status, result.Error = "skipped", "request output directory is not dedicated"
+		return result
+	}
+	if err := os.RemoveAll(filepath.Dir(codexHomeDir(c, id))); err != nil {
+		log.Printf("event=skill2api_cleanup request_id=%s result=session_remove_failed error=%q", id, err)
+		result.Status, result.Error = "failed", "remove private Codex session"
+		return result
+	}
+	if err := os.RemoveAll(filepath.Join(s.root, id)); err != nil {
+		log.Printf("event=skill2api_cleanup request_id=%s result=data_remove_failed error=%q", id, err)
+		result.Status, result.Error = "failed", "remove task data"
+		return result
+	}
+	log.Printf("event=skill2api_cleanup request_id=%s result=deleted", id)
+	result.Status = "deleted"
+	return result
+}
+
 func validateRequest(req generateRequest, c config) error {
 	if !validID(req.RequestID) {
 		return errors.New("request_id must contain only letters, digits, dot, underscore, or hyphen")
@@ -710,14 +790,19 @@ func codexHomeDir(c config, requestID string) string {
 }
 
 func newCodexCommand(ctx context.Context, c config, requestID, outputDir string, environment map[string]string, args []string) (*exec.Cmd, string, error) {
-	if !c.CodexDocker {
-		cmd := exec.CommandContext(ctx, c.CodexBin, args...)
-		cmd.Env = codexEnvironment(os.Environ(), environment, c.CodexNoProxy)
-		return cmd, c.CodexBin, nil
-	}
 	home := codexHomeDir(c, requestID)
 	if err := os.MkdirAll(home, 0700); err != nil {
-		return nil, c.CodexDockerBin, fmt.Errorf("create Codex home: %w", err)
+		return nil, c.CodexBin, fmt.Errorf("create Codex home: %w", err)
+	}
+	if !c.CodexDocker {
+		cmd := exec.CommandContext(ctx, c.CodexBin, args...)
+		nativeEnvironment := make(map[string]string, len(environment)+1)
+		for key, value := range environment {
+			nativeEnvironment[key] = value
+		}
+		nativeEnvironment["HOME"] = home
+		cmd.Env = codexEnvironment(os.Environ(), nativeEnvironment, c.CodexNoProxy)
+		return cmd, c.CodexBin, nil
 	}
 	dockerArgs := []string{"run", "--rm", "--init", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())}
 	if !c.CodexNetworkAccess {
@@ -1160,6 +1245,7 @@ func handleGenerate(job periodic.Job, store *statusStore, manager *taskManager, 
 		return
 	}
 	log.Printf("event=skill2api_state request_id=%s status=queued skill_name=%s output_dir=%s force=%t", req.RequestID, req.SkillName, req.OutputDir, req.Force)
+	scheduleCleanup(c, req.RequestID)
 	doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "queued"})
 	go execute(store, manager, c, req)
 }
@@ -1275,6 +1361,7 @@ func handleResume(job periodic.Job, store *statusStore, manager *taskManager, c 
 		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": v.Status, "error": v.Error})
 		return
 	}
+	scheduleCleanup(c, req.RequestID)
 	doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "running"})
 	go executeResume(store, manager, c, req, v)
 }
@@ -1312,6 +1399,39 @@ func handleTerminate(job periodic.Job, store *statusStore, manager *taskManager)
 	doneJSON(job, map[string]any{"request_id": req.RequestID, "status": v.Status, "error": v.Error})
 }
 
+func handleCleanup(job periodic.Job, store *statusStore, c config) {
+	var req statusRequest
+	if strings.TrimSpace(job.Args) != "" {
+		if err := parseArgs(job, &req); err != nil {
+			log.Printf("event=skill2api_cleanup result=invalid_args")
+			_ = job.Fail()
+			return
+		}
+	}
+	if strings.TrimSpace(req.RequestID) == "" {
+		req.RequestID = job.Name
+	} else if req.RequestID != job.Name {
+		log.Printf("event=skill2api_cleanup result=invalid_args")
+		_ = job.Fail()
+		return
+	}
+	if !validID(req.RequestID) {
+		log.Printf("event=skill2api_cleanup request_id=%s result=invalid_args", req.RequestID)
+		_ = job.Fail()
+		return
+	}
+	result := store.cleanup(c, req.RequestID, time.Now().UTC())
+	if result.Status == "deferred" {
+		if err := job.SchedLater(int(retentionAge.Seconds())); err != nil {
+			log.Printf("event=skill2api_cleanup request_id=%s result=defer_failed error=%q", req.RequestID, err)
+			_ = job.Fail()
+		}
+		return
+	}
+	log.Printf("event=skill2api_cleanup request_id=%s result=%s", req.RequestID, result.Status)
+	doneJSON(job, result)
+}
+
 func registerWorkerFuncs(worker *periodic.Worker, prefix string, store *statusStore, manager *taskManager, c config) error {
 	if err := worker.AddFunc(withPrefix(prefix, generateFunc), func(job periodic.Job) { handleGenerate(job, store, manager, c) }); err != nil {
 		return err
@@ -1323,6 +1443,9 @@ func registerWorkerFuncs(worker *periodic.Worker, prefix string, store *statusSt
 		return err
 	}
 	if err := worker.AddFunc(withPrefix(prefix, terminateFunc), func(job periodic.Job) { handleTerminate(job, store, manager) }); err != nil {
+		return err
+	}
+	if err := worker.AddFunc(withPrefix(prefix, cleanupFunc), func(job periodic.Job) { handleCleanup(job, store, c) }); err != nil {
 		return err
 	}
 	return nil
