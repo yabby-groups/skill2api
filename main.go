@@ -183,7 +183,8 @@ func newConfig() (config, error) {
 	if mode != protocol.ModePlain && (priv == "" || pub == "") {
 		return config{}, errors.New("generation RSA key paths are required unless plain mode is selected")
 	}
-	timeout := envDuration("SKILL2API_CODEX_TIMEOUT_SECONDS", 15*time.Minute)
+	// Video-generation skills can legitimately spend hours waiting on remote providers.
+	timeout := envDuration("SKILL2API_CODEX_TIMEOUT_SECONDS", 6*time.Hour)
 	if timeout <= 0 {
 		return config{}, errors.New("SKILL2API_CODEX_TIMEOUT_SECONDS must be positive")
 	}
@@ -549,9 +550,12 @@ func runCodexWithSession(ctx context.Context, c config, req generateRequest, ski
 	return runCodexWithSessionCallback(ctx, c, req, skill, nil)
 }
 
+func codexPrompt(prompt string, skill []byte) string {
+	return prompt + "\n\n" + string(skill)
+}
+
 func runCodexWithSessionCallback(ctx context.Context, c config, req generateRequest, skill []byte, onSessionID func(string)) (string, string, string, error) {
-	prompt := fmt.Sprintf("%s\n\nUse the skill instructions below to implement the request as a reviewable Myna Sanic blueprint package. Write the blueprint, route entry, dependency notes, and README into the current working directory (%s). Do not modify files outside that directory.\n\nIf you need user information before continuing, do not guess. End your response with exactly two lines: SKILL2API_INPUT_REQUIRED and then a JSON object containing question and optional options.\n\nSkill instructions:\n%s", req.Prompt, req.OutputDir, string(skill))
-	return runCodexCommand(ctx, c, req.OutputDir, false, redactionLines(req.Prompt), onSessionID, []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", prompt})
+	return runCodexCommand(ctx, c, req.OutputDir, false, redactionLines(req.Prompt), onSessionID, []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", codexPrompt(req.Prompt, skill)})
 }
 
 func runCodexResume(ctx context.Context, c config, req taskStatus, answer, instruction string) (string, string, error) {

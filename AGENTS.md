@@ -43,7 +43,7 @@ Optional settings include:
 
 - `SKILL2API_SKILLS_DIR` (defaults to `skills`)
 - `SKILL2API_CODEX_BIN` (defaults to `codex`)
-- `SKILL2API_CODEX_TIMEOUT_SECONDS` (defaults to 900)
+- `SKILL2API_CODEX_TIMEOUT_SECONDS` (defaults to 21600 / 6 hours)
 - `SKILL2API_MAX_OUTPUT_BYTES` (defaults to 65536)
 - `TASK_PREFIX`
 - `PERIODIC_RSA_MODE`

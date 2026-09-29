@@ -121,6 +121,19 @@ func TestParseInputRequest(t *testing.T) {
 	}
 }
 
+func TestCodexPromptPreservesCallerPromptAndSkillVerbatim(t *testing.T) {
+	prompt := "Replace the product in this video."
+	skill := []byte("---\nname: hypit\n---\nUse the supplied references.")
+	got := codexPrompt(prompt, skill)
+	want := prompt + "\n\n" + string(skill)
+	if got != want {
+		t.Fatalf("Codex prompt was rewritten:\nwant %q\n got %q", want, got)
+	}
+	if strings.Contains(got, "Myna Sanic") || strings.Contains(got, "blueprint package") {
+		t.Fatalf("Codex prompt contains an unrelated task wrapper: %q", got)
+	}
+}
+
 func TestClaimWaitingIsAtomic(t *testing.T) {
 	store := &statusStore{root: t.TempDir()}
 	if err := store.write(taskStatus{RequestID: "r1", Status: "waiting_for_input", SessionID: "session-1"}); err != nil {
@@ -460,7 +473,24 @@ func TestConfigPlainModeUsesPeriodicSettings(t *testing.T) {
 	if c.RSA.Mode != protocol.ModePlain || c.TaskPrefix != "generation-" || c.PeriodicAddr == "" {
 		t.Fatalf("unexpected config: %#v", c)
 	}
+	if c.Timeout != 6*time.Hour {
+		t.Fatalf("default Codex timeout = %s, want %s", c.Timeout, 6*time.Hour)
+	}
 	if withPrefix(c.TaskPrefix, generateFunc) != "generation-skill2api_generate" || statusFunc != "skill2api_status" {
 		t.Fatal("periodic function naming contract changed")
+	}
+}
+
+func TestConfigCodexTimeoutOverride(t *testing.T) {
+	t.Setenv("PERIODIC_PORT", "tcp://periodic:5000")
+	t.Setenv("PERIODIC_RSA_MODE", "0")
+	t.Setenv("SKILL2API_OUTPUT_ROOT", t.TempDir())
+	t.Setenv("SKILL2API_CODEX_TIMEOUT_SECONDS", "28800")
+	c, err := newConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Timeout != 8*time.Hour {
+		t.Fatalf("Codex timeout override = %s, want %s", c.Timeout, 8*time.Hour)
 	}
 }

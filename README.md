@@ -71,6 +71,13 @@ Caller-provided prompts and resume answers are redacted before either log is
 written. Codex session IDs are also redacted from public logs and status
 responses; the worker retains the ID privately for resume.
 
+## Codex Execution Timeout
+
+`SKILL2API_CODEX_TIMEOUT_SECONDS` bounds each Codex execution, including an
+execution resumed after an interactive prompt. It defaults to 21600 seconds
+(6 hours), which accommodates long-running video-generation skills. Set it to
+a larger positive number when a deployment needs a longer limit.
+
 ## Terminate a Job
 
 Terminate a queued, running, or waiting-for-input task with the same request ID:
