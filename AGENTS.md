@@ -43,6 +43,7 @@ Optional settings include:
 
 - `SKILL2API_SKILLS_DIR` (defaults to `skills`)
 - `SKILL2API_CODEX_BIN` (defaults to `codex`)
+- `SKILL2API_CODEX_DOCKER_OPT_DIR` (optional host directory mounted read-only at container `/opt` in Docker mode; `/opt/bin` is added to `PATH`)
 - `SKILL2API_CODEX_TIMEOUT_SECONDS` (defaults to 21600 / 6 hours)
 - `SKILL2API_MAX_OUTPUT_BYTES` (defaults to 65536)
 - `TASK_PREFIX`

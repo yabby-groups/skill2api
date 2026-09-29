@@ -145,6 +145,7 @@ type config struct {
 	CodexDocker        bool
 	CodexDockerBin     string
 	CodexDockerImage   string
+	CodexDockerOptDir  string
 	CodexNoProxy       bool
 	CodexNetworkAccess bool
 	Timeout            time.Duration
@@ -234,7 +235,21 @@ func newConfig() (config, error) {
 	if err != nil {
 		return config{}, errors.New("SKILL2API_CODEX_DOCKER must be true or false")
 	}
-	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexNoProxy: noProxy, CodexNetworkAccess: networkAccess, Timeout: timeout, MaxOutput: limit, MaxFileBytes: fileLimit}, nil
+	optDir := strings.TrimSpace(os.Getenv("SKILL2API_CODEX_DOCKER_OPT_DIR"))
+	if dockerEnabled && optDir != "" {
+		optDir, err = filepath.Abs(optDir)
+		if err != nil {
+			return config{}, fmt.Errorf("resolve SKILL2API_CODEX_DOCKER_OPT_DIR: %w", err)
+		}
+		info, statErr := os.Stat(optDir)
+		if statErr != nil || !info.IsDir() {
+			if statErr != nil {
+				return config{}, fmt.Errorf("SKILL2API_CODEX_DOCKER_OPT_DIR must be an existing directory: %w", statErr)
+			}
+			return config{}, errors.New("SKILL2API_CODEX_DOCKER_OPT_DIR must be an existing directory")
+		}
+	}
+	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexDockerOptDir: optDir, CodexNoProxy: noProxy, CodexNetworkAccess: networkAccess, Timeout: timeout, MaxOutput: limit, MaxFileBytes: fileLimit}, nil
 }
 func firstEnvDefault(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -801,6 +816,17 @@ func codexHomeDir(c config, requestID string) string {
 	return filepath.Join(c.OutputRoot, ".skill2api-codex", requestID, "home")
 }
 
+func dockerEnvironment(c config, environment map[string]string) map[string]string {
+	merged := make(map[string]string, len(environment)+1)
+	for key, value := range environment {
+		merged[key] = value
+	}
+	if c.CodexDockerOptDir != "" {
+		merged["PATH"] = "/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+	return merged
+}
+
 func newCodexCommand(ctx context.Context, c config, requestID, outputDir string, environment map[string]string, args []string) (*exec.Cmd, string, error) {
 	home := codexHomeDir(c, requestID)
 	if err := os.MkdirAll(home, 0700); err != nil {
@@ -826,8 +852,12 @@ func newCodexCommand(ctx context.Context, c config, requestID, outputDir string,
 		"--workdir", "/workspace",
 		"--env", "HOME=/home/ubuntu",
 	)
-	keys := make([]string, 0, len(environment))
-	for key := range environment {
+	dockerEnv := dockerEnvironment(c, environment)
+	if c.CodexDockerOptDir != "" {
+		dockerArgs = append(dockerArgs, "--mount", "type=bind,src="+c.CodexDockerOptDir+",dst=/opt,readonly")
+	}
+	keys := make([]string, 0, len(dockerEnv))
+	for key := range dockerEnv {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
@@ -837,7 +867,7 @@ func newCodexCommand(ctx context.Context, c config, requestID, outputDir string,
 	dockerArgs = append(dockerArgs, c.CodexDockerImage)
 	dockerArgs = append(dockerArgs, args...)
 	cmd := exec.CommandContext(ctx, c.CodexDockerBin, dockerArgs...)
-	cmd.Env = codexEnvironment(os.Environ(), environment, c.CodexNoProxy)
+	cmd.Env = codexEnvironment(os.Environ(), dockerEnv, c.CodexNoProxy)
 	return cmd, c.CodexDockerBin, nil
 }
 

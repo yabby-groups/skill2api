@@ -120,12 +120,19 @@ instead of invoking the worker host's `codex` binary. The default image is
 `SKILL2API_CODEX_DOCKER_IMAGE`. `SKILL2API_CODEX_DOCKER_BIN` selects the Docker
 CLI binary and defaults to `docker`.
 
-The worker mounts only the task output directory at `/workspace` and a private,
+The worker mounts the task output directory at `/workspace` and a private,
 per-request Codex home at `/home/ubuntu`. The private home retains the Codex
 session across `skill2api_resume` calls and is not included in the task's
 `files` response. Codex runs in the container with
-`--sandbox danger-full-access`; do not mount the Docker socket or other host
-directories into this runner.
+`--sandbox danger-full-access`; do not mount the Docker socket into this
+runner.
+
+Optionally set `SKILL2API_CODEX_DOCKER_OPT_DIR` to an existing host directory
+of externally managed tools. When Docker mode is enabled, the worker mounts it
+read-only at `/opt` and adds `/opt/bin` ahead of the standard container paths.
+The Docker UID/GID must be able to read and execute every required directory
+and executable. Leave this variable unset to retain the default mounts and
+container `PATH`.
 
 Pass `SANDBOX_AI_KEY` in the request `environment` object on every generation
 and resume. This request value takes precedence. When omitted, the worker's

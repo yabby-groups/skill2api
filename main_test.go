@@ -224,6 +224,9 @@ func TestDockerCodexCommandIsolatedAndReceivesExplicitEnvironment(t *testing.T) 
 			t.Fatalf("docker command missing %q: %q", want, joined)
 		}
 	}
+	if strings.Contains(joined, "dst=/opt") {
+		t.Fatalf("Docker command mounted /opt without configuration: %q", cmd.Args)
+	}
 	if strings.Contains(joined, "client-key") || strings.Contains(joined, "other-value") {
 		t.Fatalf("docker command exposed environment values: %q", joined)
 	}
@@ -243,6 +246,33 @@ func TestDockerCodexCommandIsolatedAndReceivesExplicitEnvironment(t *testing.T) 
 	}
 	if strings.Contains(strings.Join(cmd.Args, "\n"), "--network\nnone") {
 		t.Fatalf("network-enabled Docker command remained isolated: %#v", cmd.Args)
+	}
+}
+
+func TestDockerCodexOptionalOptMountAndPath(t *testing.T) {
+	c, root := testConfig(t)
+	c.CodexDocker = true
+	c.CodexDockerOptDir = filepath.Join(root, "external-tools")
+	if err := os.MkdirAll(c.CodexDockerOptDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	outputDir := filepath.Join(root, "request-1")
+	if err := os.MkdirAll(outputDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	cmd, _, err := newCodexCommand(context.Background(), c, "request-1", outputDir, map[string]string{"PATH": "/request/bin"}, []string{"exec"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(cmd.Args, "\n")
+	if !strings.Contains(joined, "src="+c.CodexDockerOptDir+",dst=/opt,readonly") {
+		t.Fatalf("Docker command did not mount external tools read-only: %q", cmd.Args)
+	}
+	if strings.Contains(joined, "/request/bin") {
+		t.Fatalf("Docker command exposed PATH value: %q", cmd.Args)
+	}
+	if !strings.Contains(strings.Join(cmd.Env, "\n"), "PATH=/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin") {
+		t.Fatalf("Docker command did not set the /opt PATH: %#v", cmd.Env)
 	}
 }
 
@@ -830,5 +860,25 @@ func TestConfigCodexDocker(t *testing.T) {
 	t.Setenv("SKILL2API_CODEX_DOCKER", "invalid")
 	if _, err := newConfig(); err == nil || !strings.Contains(err.Error(), "SKILL2API_CODEX_DOCKER") {
 		t.Fatalf("invalid Docker setting error = %v", err)
+	}
+}
+
+func TestConfigCodexDockerOptDir(t *testing.T) {
+	t.Setenv("PERIODIC_PORT", "tcp://periodic:5000")
+	t.Setenv("PERIODIC_RSA_MODE", "0")
+	t.Setenv("SKILL2API_OUTPUT_ROOT", t.TempDir())
+	t.Setenv("SKILL2API_CODEX_DOCKER", "true")
+	optDir := t.TempDir()
+	t.Setenv("SKILL2API_CODEX_DOCKER_OPT_DIR", optDir)
+	c, err := newConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.CodexDockerOptDir != optDir {
+		t.Fatalf("Docker opt directory = %q, want %q", c.CodexDockerOptDir, optDir)
+	}
+	t.Setenv("SKILL2API_CODEX_DOCKER_OPT_DIR", filepath.Join(optDir, "missing"))
+	if _, err := newConfig(); err == nil || !strings.Contains(err.Error(), "SKILL2API_CODEX_DOCKER_OPT_DIR") {
+		t.Fatalf("invalid Docker opt directory error = %v", err)
 	}
 }
