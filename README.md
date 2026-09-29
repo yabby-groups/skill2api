@@ -8,7 +8,7 @@ user decision.
 
 - The Periodic service is running.
 - The Skill2API worker registers `skill2api_generate`, `skill2api_status`,
-  `skill2api_resume`, `skill2api_terminate`, and `skill2api_cleanup`.
+  `skill2api_file`, `skill2api_resume`, `skill2api_terminate`, and `skill2api_cleanup`.
 - `skill_name` resolves to `SKILL2API_SKILLS_DIR/<skill_name>/SKILL.md`.
 - `output_dir` is a relative path inside `SKILL2API_OUTPUT_ROOT`.
 
@@ -74,6 +74,29 @@ output changes: log tails are read only when `skill2api_status` is called.
 Caller-provided prompts and resume answers are redacted before either log is
 written. Codex session IDs are also redacted from public logs and status
 responses; the worker retains the ID privately for resume.
+
+## Get a Generated File
+
+Read one existing file from a task directory with its relative path. The task
+may be in any state. The successful response is the file's raw binary bytes,
+not JSON or Base64; use `file_path` to retain the filename.
+
+```bash
+periodic run skill2api_file request-1 \
+  --workload '{"request_id":"request-1","file_path":"package/output.png"}' \
+  --timeout 30 | tail -c +9 > output.png
+```
+
+The worker accepts regular files anywhere below the task output directory,
+including `status.json`, `stdout.log`, and `stderr.log`. It rejects absolute
+paths, traversal outside the directory, directories, and symbolic links that
+resolve outside the directory. Errors are JSON objects with `request_id`,
+`status`, and `error` fields. The Periodic CLI displays successful job data
+with an eight-byte `Result: ` prefix; `tail -c +9` skips it. Periodic API
+clients receive the unencoded job data directly.
+
+`SKILL2API_MAX_FILE_BYTES` limits one read and defaults to 67108864 bytes
+(64 MiB). Files over the limit are rejected without returning partial data.
 
 ## Per-request Environment and Model
 

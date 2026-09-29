@@ -24,7 +24,47 @@ func testConfig(t *testing.T) (config, string) {
 	if err := os.WriteFile(filepath.Join(skills, "demo", "SKILL.md"), []byte("make an API"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	return config{OutputRoot: root, SkillsDir: skills, CodexBin: "codex", Timeout: time.Second, MaxOutput: 16}, root
+	return config{OutputRoot: root, SkillsDir: skills, CodexBin: "codex", Timeout: time.Second, MaxOutput: 16, MaxFileBytes: 1024}, root
+}
+
+func TestReadTaskFileReturnsBinaryAndAllowsInternalFiles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "image.bin"), []byte{0, 1, 2, 255}, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "status.json"), []byte(`{"status":"running"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string][]byte{
+		"image.bin":   {0, 1, 2, 255},
+		"status.json": []byte(`{"status":"running"}`),
+	} {
+		got, err := readTaskFile(root, path, 1024)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("readTaskFile(%q) = %v, %v; want %v, nil", path, got, err, want)
+		}
+	}
+}
+
+func TestReadTaskFileRejectsUnsafeAndOversizedPaths(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "large.bin"), []byte("12345"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"", ".", "..", "../escape", filepath.Join(string(filepath.Separator), "tmp", "escape")} {
+		if _, err := readTaskFile(root, path, 1024); err == nil {
+			t.Fatalf("unsafe path %q was accepted", path)
+		}
+	}
+	if _, err := readTaskFile(root, "large.bin", 4); err == nil {
+		t.Fatal("oversized file was accepted")
+	}
+	if err := os.Symlink(os.TempDir(), filepath.Join(root, "outside")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readTaskFile(root, "outside", 1024); err == nil {
+		t.Fatal("symlink outside the output directory was accepted")
+	}
 }
 
 func TestValidateRequestRejectsTraversalAndOutsideOutput(t *testing.T) {

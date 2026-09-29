@@ -24,10 +24,12 @@ import (
 const (
 	generateFunc  = "skill2api_generate"
 	statusFunc    = "skill2api_status"
+	fileFunc      = "skill2api_file"
 	resumeFunc    = "skill2api_resume"
 	terminateFunc = "skill2api_terminate"
 	cleanupFunc   = "skill2api_cleanup"
 	maxOutput     = 64 * 1024
+	maxFileBytes  = 64 * 1024 * 1024
 	maxSkillName  = 128
 	retentionAge  = 24 * time.Hour
 	stdoutLogName = "stdout.log"
@@ -46,6 +48,11 @@ type generateRequest struct {
 
 type statusRequest struct {
 	RequestID string `json:"request_id"`
+}
+
+type fileRequest struct {
+	RequestID string `json:"request_id"`
+	FilePath  string `json:"file_path"`
 }
 
 type resumeRequest struct {
@@ -142,6 +149,7 @@ type config struct {
 	CodexNetworkAccess bool
 	Timeout            time.Duration
 	MaxOutput          int
+	MaxFileBytes       int
 }
 
 type statusStore struct {
@@ -210,6 +218,10 @@ func newConfig() (config, error) {
 	if limit < 1024 {
 		limit = 1024
 	}
+	fileLimit := envInt("SKILL2API_MAX_FILE_BYTES", maxFileBytes)
+	if fileLimit < 1 {
+		fileLimit = maxFileBytes
+	}
 	noProxy, err := strconv.ParseBool(firstEnvDefault("SKILL2API_CODEX_NO_PROXY", "false"))
 	if err != nil {
 		return config{}, errors.New("SKILL2API_CODEX_NO_PROXY must be true or false")
@@ -222,7 +234,7 @@ func newConfig() (config, error) {
 	if err != nil {
 		return config{}, errors.New("SKILL2API_CODEX_DOCKER must be true or false")
 	}
-	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexNoProxy: noProxy, CodexNetworkAccess: networkAccess, Timeout: timeout, MaxOutput: limit}, nil
+	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexNoProxy: noProxy, CodexNetworkAccess: networkAccess, Timeout: timeout, MaxOutput: limit, MaxFileBytes: fileLimit}, nil
 }
 func firstEnvDefault(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -1064,6 +1076,54 @@ func listFiles(dir string) ([]string, error) {
 	return files, err
 }
 
+func readTaskFile(outputDir, rawPath string, maxBytes int) ([]byte, error) {
+	filePath := strings.TrimSpace(rawPath)
+	if filePath == "" || filepath.IsAbs(filePath) {
+		return nil, errors.New("file_path must be a non-empty relative path")
+	}
+	clean := filepath.Clean(filePath)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return nil, errors.New("file_path must stay inside the task output directory")
+	}
+	if maxBytes < 1 {
+		return nil, errors.New("maximum file size must be positive")
+	}
+	base, err := filepath.EvalSymlinks(outputDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve output directory: %w", err)
+	}
+	target, err := filepath.EvalSymlinks(filepath.Join(outputDir, clean))
+	if err != nil {
+		return nil, fmt.Errorf("resolve file: %w", err)
+	}
+	if !within(base, target) {
+		return nil, errors.New("file_path must stay inside the task output directory")
+	}
+	file, err := os.Open(target)
+	if err != nil {
+		return nil, fmt.Errorf("open file: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("file_path must reference a regular file")
+	}
+	if info.Size() > int64(maxBytes) {
+		return nil, fmt.Errorf("file exceeds maximum size of %d bytes", maxBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, int64(maxBytes)+1))
+	if err != nil {
+		return nil, fmt.Errorf("read file: %w", err)
+	}
+	if len(data) > maxBytes {
+		return nil, fmt.Errorf("file exceeds maximum size of %d bytes", maxBytes)
+	}
+	return data, nil
+}
+
 func execute(store *statusStore, manager *taskManager, c config, req generateRequest) {
 	v, err := store.claimQueued(req.RequestID)
 	if err != nil {
@@ -1288,6 +1348,45 @@ func handleStatus(job periodic.Job, store *statusStore, c config) {
 	doneJSON(job, response)
 }
 
+func handleFile(job periodic.Job, store *statusStore, c config) {
+	var req fileRequest
+	if err := parseArgs(job, &req); err != nil {
+		log.Printf("event=skill2api_file request_id=%s result=invalid_args", job.Name)
+		doneJSON(job, map[string]any{"request_id": job.Name, "status": "failed", "error": "invalid file request"})
+		return
+	}
+	if strings.TrimSpace(req.RequestID) == "" {
+		req.RequestID = job.Name
+	} else if req.RequestID != job.Name {
+		log.Printf("event=skill2api_file request_id=%s result=request_id_mismatch job_name=%s", req.RequestID, job.Name)
+		doneJSON(job, map[string]any{"request_id": job.Name, "status": "failed", "error": "request_id must match job name"})
+		return
+	}
+	if !validID(req.RequestID) {
+		log.Printf("event=skill2api_file request_id=%s result=invalid_request_id", req.RequestID)
+		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "failed", "error": "invalid request_id"})
+		return
+	}
+	v, err := store.read(req.RequestID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "not_found", "error": "request not found"})
+			return
+		}
+		log.Printf("event=skill2api_file request_id=%s result=status_read_failed error=%q", req.RequestID, err)
+		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "failed", "error": err.Error()})
+		return
+	}
+	data, err := readTaskFile(v.OutputDir, req.FilePath, c.MaxFileBytes)
+	if err != nil {
+		log.Printf("event=skill2api_file request_id=%s result=file_read_failed error=%q", req.RequestID, err)
+		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "failed", "error": err.Error()})
+		return
+	}
+	log.Printf("event=skill2api_file request_id=%s result=returned bytes=%d", req.RequestID, len(data))
+	_ = job.Done(data)
+}
+
 func handleResume(job periodic.Job, store *statusStore, manager *taskManager, c config) {
 	var req resumeRequest
 	if strings.TrimSpace(job.Args) != "" {
@@ -1437,6 +1536,9 @@ func registerWorkerFuncs(worker *periodic.Worker, prefix string, store *statusSt
 		return err
 	}
 	if err := worker.AddFunc(withPrefix(prefix, statusFunc), func(job periodic.Job) { handleStatus(job, store, c) }); err != nil {
+		return err
+	}
+	if err := worker.AddFunc(withPrefix(prefix, fileFunc), func(job periodic.Job) { handleFile(job, store, c) }); err != nil {
 		return err
 	}
 	if err := worker.AddFunc(withPrefix(prefix, resumeFunc), func(job periodic.Job) { handleResume(job, store, manager, c) }); err != nil {
