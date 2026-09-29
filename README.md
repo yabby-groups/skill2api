@@ -7,8 +7,8 @@ user decision.
 ## Prerequisites
 
 - The Periodic service is running.
-- The Skill2API worker registers `skill2api_generate`, `skill2api_status`, and
-  `skill2api_resume`.
+- The Skill2API worker registers `skill2api_generate`, `skill2api_status`,
+  `skill2api_resume`, and `skill2api_terminate`.
 - `skill_name` resolves to `SKILL2API_SKILLS_DIR/<skill_name>/SKILL.md`.
 - `output_dir` is inside `SKILL2API_OUTPUT_ROOT`.
 
@@ -51,11 +51,29 @@ job name. The normal states are:
 | `waiting_for_input` | The skill asked a question and is waiting for an answer. |
 | `succeeded` | The task completed; `files` lists the generated files. |
 | `failed` | Execution failed; inspect `error`, `stdout`, and `stderr`. |
+| `terminated` | The task was stopped by an explicit terminate request. |
 | `not_found` | No job exists for the requested ID. |
 
-Poll every few seconds until the job reaches `succeeded`, `failed`, or
-`waiting_for_input`. Skill2API does not fabricate percentage progress; while a
+Poll every few seconds until the job reaches `succeeded`, `failed`,
+`waiting_for_input`, or `terminated`. Skill2API does not fabricate percentage progress; while a
 job is executing, the reliable progress signal is `running`.
+
+## Terminate a Job
+
+Terminate a queued, running, or waiting-for-input task with the same request ID:
+
+```bash
+periodic run skill2api_terminate request-1 --timeout 30
+```
+
+The response is terminal and the task can no longer be resumed:
+
+```json
+{"request_id":"request-1","status":"terminated","error":"terminated by user"}
+```
+
+For a running task, the worker cancels the Codex process. Generated files are
+kept; termination only updates the task state.
 
 ## Interactive Protocol
 

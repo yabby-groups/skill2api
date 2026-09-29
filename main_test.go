@@ -90,6 +90,60 @@ func TestClaimWaitingIsAtomic(t *testing.T) {
 	}
 }
 
+func TestTerminateTransitionsActiveStates(t *testing.T) {
+	store := &statusStore{root: t.TempDir()}
+	for _, state := range []string{"queued", "running", "waiting_for_input"} {
+		id := "request-" + state
+		if err := store.write(taskStatus{RequestID: id, Status: state, Question: "question", Phase: "clarification"}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := store.terminate(id)
+		if err != nil || got.Status != "terminated" || got.Error != "terminated by user" || got.FinishedAt == "" {
+			t.Fatalf("terminate %s: %#v err=%v", state, got, err)
+		}
+		if got.Question != "" || got.Phase != "" {
+			t.Fatalf("interactive fields were retained: %#v", got)
+		}
+		again, err := store.terminate(id)
+		if err != nil || again.Status != "terminated" {
+			t.Fatalf("repeated terminate: %#v err=%v", again, err)
+		}
+	}
+}
+
+func TestWriteFromRunningDoesNotOverrideTermination(t *testing.T) {
+	store := &statusStore{root: t.TempDir()}
+	running := taskStatus{RequestID: "r1", Status: "running", StartedAt: "started"}
+	if err := store.write(running); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.terminate(running.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	running.Status = "succeeded"
+	written, err := store.writeFromRunning(running)
+	if err != nil || written {
+		t.Fatalf("terminated request was overwritten: written=%t err=%v", written, err)
+	}
+	got, err := store.read(running.RequestID)
+	if err != nil || got.Status != "terminated" {
+		t.Fatalf("unexpected stored status: %#v err=%v", got, err)
+	}
+}
+
+func TestTaskManagerCancel(t *testing.T) {
+	manager := newTaskManager()
+	done := make(chan struct{})
+	manager.register("r1", func() { close(done) })
+	manager.cancel("r1")
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancel function was not called")
+	}
+	manager.unregister("r1")
+}
+
 func TestPublicStatusDoesNotExposeSession(t *testing.T) {
 	data, err := json.Marshal(publicStatus(taskStatus{RequestID: "r1", Status: "waiting_for_input", SessionID: "secret"}))
 	if err != nil {

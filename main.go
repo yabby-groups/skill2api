@@ -20,11 +20,12 @@ import (
 )
 
 const (
-	generateFunc = "skill2api_generate"
-	statusFunc   = "skill2api_status"
-	resumeFunc   = "skill2api_resume"
-	maxOutput    = 64 * 1024
-	maxSkillName = 128
+	generateFunc  = "skill2api_generate"
+	statusFunc    = "skill2api_status"
+	resumeFunc    = "skill2api_resume"
+	terminateFunc = "skill2api_terminate"
+	maxOutput     = 64 * 1024
+	maxSkillName  = 128
 )
 
 type generateRequest struct {
@@ -42,6 +43,10 @@ type statusRequest struct {
 type resumeRequest struct {
 	RequestID string `json:"request_id"`
 	Answer    string `json:"answer"`
+}
+
+type terminateRequest struct {
+	RequestID string `json:"request_id"`
 }
 
 type taskStatus struct {
@@ -105,6 +110,36 @@ type config struct {
 type statusStore struct {
 	root string
 	mu   sync.Mutex
+}
+
+type taskManager struct {
+	mu      sync.Mutex
+	cancels map[string]context.CancelFunc
+}
+
+func newTaskManager() *taskManager {
+	return &taskManager{cancels: make(map[string]context.CancelFunc)}
+}
+
+func (m *taskManager) register(id string, cancel context.CancelFunc) {
+	m.mu.Lock()
+	m.cancels[id] = cancel
+	m.mu.Unlock()
+}
+
+func (m *taskManager) unregister(id string) {
+	m.mu.Lock()
+	delete(m.cancels, id)
+	m.mu.Unlock()
+}
+
+func (m *taskManager) cancel(id string) {
+	m.mu.Lock()
+	cancel := m.cancels[id]
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func newConfig() (config, error) {
@@ -244,6 +279,58 @@ func (s *statusStore) claimWaiting(id string) (taskStatus, error) {
 	}
 	v.Status = "running"
 	v.Question, v.Options, v.Phase, v.Error = "", nil, "", ""
+	if err := s.writeUnlocked(v); err != nil {
+		return taskStatus{}, err
+	}
+	return v, nil
+}
+
+func (s *statusStore) claimQueued(id string) (taskStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, err := s.readUnlocked(id)
+	if err != nil {
+		return taskStatus{}, err
+	}
+	if v.Status != "queued" {
+		return v, errors.New("request is not queued")
+	}
+	v.Status = "running"
+	v.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	if err := s.writeUnlocked(v); err != nil {
+		return taskStatus{}, err
+	}
+	return v, nil
+}
+
+// writeFromRunning applies an execution result only while this attempt owns the request.
+func (s *statusStore) writeFromRunning(v taskStatus) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, err := s.readUnlocked(v.RequestID)
+	if err != nil {
+		return false, err
+	}
+	if current.Status != "running" || current.StartedAt != v.StartedAt {
+		return false, nil
+	}
+	return true, s.writeUnlocked(v)
+}
+
+func (s *statusStore) terminate(id string) (taskStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, err := s.readUnlocked(id)
+	if err != nil {
+		return taskStatus{}, err
+	}
+	if v.Status == "succeeded" || v.Status == "failed" || v.Status == "terminated" {
+		return v, nil
+	}
+	v.Status = "terminated"
+	v.Error = "terminated by user"
+	v.Question, v.Options, v.Phase = "", nil, ""
+	v.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	if err := s.writeUnlocked(v); err != nil {
 		return taskStatus{}, err
 	}
@@ -437,32 +524,45 @@ func listFiles(dir string) ([]string, error) {
 	return files, err
 }
 
-func execute(store *statusStore, c config, req generateRequest) {
-	v, err := store.read(req.RequestID)
+func execute(store *statusStore, manager *taskManager, c config, req generateRequest) {
+	v, err := store.claimQueued(req.RequestID)
 	if err != nil {
-		log.Printf("event=skill2api_execute request_id=%s result=missing_status error=%q", req.RequestID, err)
+		if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
+			return
+		}
+		log.Printf("event=skill2api_execute request_id=%s result=not_started error=%q", req.RequestID, err)
 		return
 	}
-	v.Status = "running"
-	v.StartedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	_ = store.write(v)
+	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
+	manager.register(req.RequestID, cancel)
+	defer manager.unregister(req.RequestID)
+	if current, readErr := store.read(req.RequestID); readErr != nil || current.Status == "terminated" {
+		cancel()
+		return
+	}
 	log.Printf("event=skill2api_state request_id=%s status=running skill_name=%s output_dir=%s", req.RequestID, req.SkillName, req.OutputDir)
 	if err := os.MkdirAll(req.OutputDir, 0750); err != nil {
+		cancel()
+		if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
+			return
+		}
 		v.Status = "failed"
 		v.Error = fmt.Sprintf("create output directory: %v", err)
 		v.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
-		_ = store.write(v)
+		_, _ = store.writeFromRunning(v)
 		log.Printf("event=skill2api_state request_id=%s status=failed error=%q", req.RequestID, v.Error)
 		return
 	}
 	skill, err := os.ReadFile(filepath.Join(c.SkillsDir, req.SkillName, "SKILL.md"))
 	if err == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
 		v.Stdout, v.Stderr, err = runCodex(ctx, c, req, skill)
 		cancel()
 		v.SessionID = sessionIDFromStderr(v.Stderr)
 	}
 	if err != nil {
+		if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
+			return
+		}
 		v.Status = "failed"
 		v.Error = err.Error()
 		v.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
@@ -472,6 +572,9 @@ func execute(store *statusStore, c config, req generateRequest) {
 	}
 	if input, needed, parseErr := parseInputRequest(v.Stdout); needed {
 		if parseErr != nil || v.SessionID == "" {
+			if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
+				return
+			}
 			v.Status = "failed"
 			if parseErr != nil {
 				v.Error = parseErr.Error()
@@ -479,20 +582,26 @@ func execute(store *statusStore, c config, req generateRequest) {
 				v.Error = "Codex session ID was not found; cannot resume interactive task"
 			}
 		} else {
+			if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
+				return
+			}
 			v.Status = "waiting_for_input"
 			v.Phase = "clarification"
 			v.Question = input.Question
 			v.Options = input.Options
 			v.Error = ""
-			_ = store.write(v)
+			_, _ = store.writeFromRunning(v)
 			log.Printf("event=skill2api_state request_id=%s status=waiting_for_input", req.RequestID)
 			return
 		}
 		if v.Status == "failed" {
 			v.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
-			_ = store.write(v)
+			_, _ = store.writeFromRunning(v)
 			return
 		}
+	}
+	if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
+		return
 	}
 	v.Status = "succeeded"
 	v.Files, err = listFiles(req.OutputDir)
@@ -501,15 +610,24 @@ func execute(store *statusStore, c config, req generateRequest) {
 		v.Error = err.Error()
 	}
 	v.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	_ = store.write(v)
+	_, _ = store.writeFromRunning(v)
 	log.Printf("event=skill2api_state request_id=%s status=%s files=%d error=%q", req.RequestID, v.Status, len(v.Files), v.Error)
 }
 
-func executeResume(store *statusStore, c config, req resumeRequest, v taskStatus) {
+func executeResume(store *statusStore, manager *taskManager, c config, req resumeRequest, v taskStatus) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
+	manager.register(req.RequestID, cancel)
+	defer manager.unregister(req.RequestID)
+	if current, readErr := store.read(req.RequestID); readErr != nil || current.Status == "terminated" {
+		cancel()
+		return
+	}
 	var err error
 	v.Stdout, v.Stderr, err = runCodexResume(ctx, c, v, req.Answer)
 	cancel()
+	if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
+		return
+	}
 	v.Question, v.Options, v.Phase = "", nil, ""
 	if err != nil {
 		v.Status = "failed"
@@ -533,7 +651,7 @@ func executeResume(store *statusStore, c config, req resumeRequest, v taskStatus
 	if v.Status == "succeeded" || v.Status == "failed" {
 		v.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
-	_ = store.write(v)
+	_, _ = store.writeFromRunning(v)
 }
 
 func parseArgs[T any](job periodic.Job, out *T) error {
@@ -550,7 +668,7 @@ func doneJSON(job periodic.Job, payload any) {
 	}
 	_ = job.Done(data)
 }
-func handleGenerate(job periodic.Job, store *statusStore, c config) {
+func handleGenerate(job periodic.Job, store *statusStore, manager *taskManager, c config) {
 	var req generateRequest
 	if err := parseArgs(job, &req); err != nil {
 		log.Printf("event=skill2api_generate request_id=%s result=invalid_args error=%q", req.RequestID, err)
@@ -578,7 +696,7 @@ func handleGenerate(job periodic.Job, store *statusStore, c config) {
 	}
 	log.Printf("event=skill2api_state request_id=%s status=queued skill_name=%s output_dir=%s force=%t", req.RequestID, req.SkillName, req.OutputDir, req.Force)
 	doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "queued"})
-	go execute(store, c, req)
+	go execute(store, manager, c, req)
 }
 func handleStatus(job periodic.Job, store *statusStore) {
 	var req statusRequest
@@ -615,7 +733,7 @@ func handleStatus(job periodic.Job, store *statusStore) {
 	doneJSON(job, publicStatus(v))
 }
 
-func handleResume(job periodic.Job, store *statusStore, c config) {
+func handleResume(job periodic.Job, store *statusStore, manager *taskManager, c config) {
 	var req resumeRequest
 	if err := parseArgs(job, &req); err != nil || !validID(req.RequestID) || strings.TrimSpace(req.Answer) == "" {
 		_ = job.Fail()
@@ -644,17 +762,53 @@ func handleResume(job periodic.Job, store *statusStore, c config) {
 		return
 	}
 	doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "running"})
-	go executeResume(store, c, req, v)
+	go executeResume(store, manager, c, req, v)
 }
 
-func registerWorkerFuncs(worker *periodic.Worker, prefix string, store *statusStore, c config) error {
-	if err := worker.AddFunc(withPrefix(prefix, generateFunc), func(job periodic.Job) { handleGenerate(job, store, c) }); err != nil {
+func handleTerminate(job periodic.Job, store *statusStore, manager *taskManager) {
+	var req terminateRequest
+	if strings.TrimSpace(job.Args) != "" {
+		if err := parseArgs(job, &req); err != nil {
+			_ = job.Fail()
+			return
+		}
+	}
+	if strings.TrimSpace(req.RequestID) == "" {
+		req.RequestID = job.Name
+	} else if req.RequestID != job.Name {
+		_ = job.Fail()
+		return
+	}
+	if !validID(req.RequestID) {
+		_ = job.Fail()
+		return
+	}
+	v, err := store.terminate(req.RequestID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "not_found", "error": "request not found"})
+			return
+		}
+		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "failed", "error": err.Error()})
+		return
+	}
+	if v.Status == "terminated" {
+		manager.cancel(req.RequestID)
+	}
+	doneJSON(job, map[string]any{"request_id": req.RequestID, "status": v.Status, "error": v.Error})
+}
+
+func registerWorkerFuncs(worker *periodic.Worker, prefix string, store *statusStore, manager *taskManager, c config) error {
+	if err := worker.AddFunc(withPrefix(prefix, generateFunc), func(job periodic.Job) { handleGenerate(job, store, manager, c) }); err != nil {
 		return err
 	}
 	if err := worker.AddFunc(withPrefix(prefix, statusFunc), func(job periodic.Job) { handleStatus(job, store) }); err != nil {
 		return err
 	}
-	if err := worker.AddFunc(withPrefix(prefix, resumeFunc), func(job periodic.Job) { handleResume(job, store, c) }); err != nil {
+	if err := worker.AddFunc(withPrefix(prefix, resumeFunc), func(job periodic.Job) { handleResume(job, store, manager, c) }); err != nil {
+		return err
+	}
+	if err := worker.AddFunc(withPrefix(prefix, terminateFunc), func(job periodic.Job) { handleTerminate(job, store, manager) }); err != nil {
 		return err
 	}
 	return nil
@@ -669,6 +823,7 @@ func main() {
 		panic(err)
 	}
 	store := &statusStore{root: c.OutputRoot}
+	manager := newTaskManager()
 	if err := os.MkdirAll(c.OutputRoot, 0750); err != nil {
 		panic(err)
 	}
@@ -683,7 +838,7 @@ func main() {
 			time.Sleep(time.Second)
 			continue
 		}
-		if err := registerWorkerFuncs(worker, c.TaskPrefix, store, c); err != nil {
+		if err := registerWorkerFuncs(worker, c.TaskPrefix, store, manager, c); err != nil {
 			worker.Close()
 			time.Sleep(time.Second)
 			continue
