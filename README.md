@@ -25,7 +25,7 @@ periodic run skill2api_generate request-1 \
     "output_dir": "request-1",
     "prompt": "Generate the requested health-check package.",
     "environment": {
-      "OPENAI_API_KEY": "provider-key-for-this-request"
+      "SANDBOX_AI_KEY": "provider-key-for-this-request"
     },
     "model": "gpt-6-sol",
     "force": false
@@ -89,6 +89,26 @@ because the worker does not persist them.
 and uses the same model for every resume. `skill2api_resume` does not accept a
 model override.
 
+## Docker Codex Runner
+
+Set `SKILL2API_CODEX_DOCKER=true` to run Codex in a one-shot Docker container
+instead of invoking the worker host's `codex` binary. The default image is
+`lupino/sandbox-runner:latest`; override it with
+`SKILL2API_CODEX_DOCKER_IMAGE`. `SKILL2API_CODEX_DOCKER_BIN` selects the Docker
+CLI binary and defaults to `docker`.
+
+The worker mounts only the task output directory at `/workspace` and a private,
+per-request Codex home at `/home/ubuntu`. The private home retains the Codex
+session across `skill2api_resume` calls and is not included in the task's
+`files` response. Codex runs in the container with
+`--sandbox danger-full-access`; do not mount the Docker socket or other host
+directories into this runner.
+
+Pass `SANDBOX_AI_KEY` in the request `environment` object on every generation
+and resume. This request value takes precedence. When omitted, the worker's
+`SANDBOX_AI_KEY` environment variable is used as a deployment-level fallback.
+Neither source is persisted or returned.
+
 ## Codex Execution Timeout
 
 `SKILL2API_CODEX_TIMEOUT_SECONDS` bounds each Codex execution, including an
@@ -103,9 +123,9 @@ directly. The worker then removes `http_proxy`, `https_proxy`, `all_proxy`, and
 `no_proxy` from the Codex subprocess environment. The default is `false`.
 
 Set `SKILL2API_CODEX_NETWORK_ACCESS=true` to allow direct outbound network
-connections from the Codex `workspace-write` sandbox. The worker passes
-`-c sandbox_workspace_write.network_access=true` to Codex while retaining the
-same filesystem sandbox. The default is `false`.
+connections. Native Codex runs receive the corresponding `workspace-write`
+sandbox setting. Docker Codex runs omit their default `--network none` and use
+the Docker default network. The default is `false`.
 
 ## Terminate a Job
 

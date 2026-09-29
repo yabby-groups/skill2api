@@ -127,6 +127,9 @@ type config struct {
 	OutputRoot         string
 	SkillsDir          string
 	CodexBin           string
+	CodexDocker        bool
+	CodexDockerBin     string
+	CodexDockerImage   string
 	CodexNoProxy       bool
 	CodexNetworkAccess bool
 	Timeout            time.Duration
@@ -207,7 +210,11 @@ func newConfig() (config, error) {
 	if err != nil {
 		return config{}, errors.New("SKILL2API_CODEX_NETWORK_ACCESS must be true or false")
 	}
-	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexNoProxy: noProxy, CodexNetworkAccess: networkAccess, Timeout: timeout, MaxOutput: limit}, nil
+	dockerEnabled, err := strconv.ParseBool(firstEnvDefault("SKILL2API_CODEX_DOCKER", "false"))
+	if err != nil {
+		return config{}, errors.New("SKILL2API_CODEX_DOCKER must be true or false")
+	}
+	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexNoProxy: noProxy, CodexNetworkAccess: networkAccess, Timeout: timeout, MaxOutput: limit}, nil
 }
 func firstEnvDefault(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -597,8 +604,9 @@ func codexPrompt(prompt string, skill []byte) string {
 }
 
 func runCodexWithSessionCallback(ctx context.Context, c config, req generateRequest, skill []byte, onSessionID func(string)) (string, string, string, error) {
-	redactions := append(redactionLines(req.Prompt), environmentRedactions(req.Environment)...)
-	return runCodexCommand(ctx, c, req.OutputDir, false, req.Environment, redactions, onSessionID, req.Model, []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", codexPrompt(req.Prompt, skill)})
+	environment := codexRequestEnvironment(c, req.Environment)
+	redactions := append(redactionLines(req.Prompt), environmentRedactions(environment)...)
+	return runCodexCommand(ctx, c, req.RequestID, req.OutputDir, false, environment, redactions, onSessionID, codexExecArgs(c, req.Model, req.OutputDir, []string{codexPrompt(req.Prompt, skill)}))
 }
 
 func runCodexResume(ctx context.Context, c config, req taskStatus, answer, instruction string, environment map[string]string) (string, string, error) {
@@ -610,13 +618,14 @@ func runCodexResume(ctx context.Context, c config, req taskStatus, answer, instr
 		prompt += fmt.Sprintf("\n\nAdditional user instruction: %s", instruction)
 	}
 	prompt += "\n\nIf another clarification is required, end your response with exactly two lines: SKILL2API_INPUT_REQUIRED and then a JSON object containing question and optional options."
+	environment = codexRequestEnvironment(c, environment)
 	redactions := append(redactionLines(answer), redactionLines(instruction)...)
 	redactions = append(redactions, environmentRedactions(environment)...)
-	stdout, stderr, _, err := runCodexCommand(ctx, c, req.OutputDir, true, environment, redactions, nil, req.Model, []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", "resume", req.SessionID, prompt})
+	stdout, stderr, _, err := runCodexCommand(ctx, c, req.RequestID, req.OutputDir, true, environment, redactions, nil, codexExecArgs(c, req.Model, req.OutputDir, []string{"resume", req.SessionID, prompt}))
 	return stdout, stderr, err
 }
 
-func runCodexCommand(ctx context.Context, c config, outputDir string, appendLogs bool, environment map[string]string, redactions []string, onSessionID func(string), model string, args []string) (string, string, string, error) {
+func runCodexCommand(ctx context.Context, c config, requestID, outputDir string, appendLogs bool, environment map[string]string, redactions []string, onSessionID func(string), args []string) (string, string, string, error) {
 	stdoutOffset, stderrOffset, err := outputLogOffsets(outputDir)
 	if err != nil {
 		return "", "", "", err
@@ -628,9 +637,13 @@ func runCodexCommand(ctx context.Context, c config, outputDir string, appendLogs
 	if err != nil {
 		return "", "", "", err
 	}
-	cmd := exec.CommandContext(ctx, c.CodexBin, codexCommandArgs(c, model, args)...)
-	cmd.Env = codexEnvironment(os.Environ(), environment, c.CodexNoProxy)
-	log.Printf("event=skill2api_codex_start output_dir=%s codex_bin=%s timeout=%s", outputDir, c.CodexBin, c.Timeout)
+	cmd, executable, err := newCodexCommand(ctx, c, requestID, outputDir, environment, args)
+	if err != nil {
+		_ = stdoutLog.Close()
+		_ = stderrLog.Close()
+		return "", "", "", err
+	}
+	log.Printf("event=skill2api_codex_start output_dir=%s codex_bin=%s timeout=%s", outputDir, executable, c.Timeout)
 	stdoutWriter := &redactingLogWriter{file: stdoutLog, redactions: redactions}
 	stderrWriter := &redactingLogWriter{file: stderrLog, redactions: redactions, onSessionID: onSessionID}
 	cmd.Stdout, cmd.Stderr = stdoutWriter, stderrWriter
@@ -657,6 +670,78 @@ func runCodexCommand(ctx context.Context, c config, outputDir string, appendLogs
 	}
 	log.Printf("event=skill2api_codex_finish result=succeeded stdout_bytes=%d stderr_bytes=%d", len(stdout), len(stderr))
 	return stdout, stderr, stderrWriter.sessionID, nil
+}
+
+func codexRequestEnvironment(c config, values map[string]string) map[string]string {
+	merged := make(map[string]string, len(values)+1)
+	for key, value := range values {
+		merged[key] = value
+	}
+	if c.CodexDocker {
+		if _, provided := merged["SANDBOX_AI_KEY"]; !provided {
+			if value, ok := os.LookupEnv("SANDBOX_AI_KEY"); ok {
+				merged["SANDBOX_AI_KEY"] = value
+			}
+		}
+	}
+	return merged
+}
+
+func codexExecArgs(c config, model, outputDir string, tail []string) []string {
+	workDir := outputDir
+	sandbox := "workspace-write"
+	if c.CodexDocker {
+		workDir = "/workspace"
+		sandbox = "danger-full-access"
+	}
+	args := []string{"exec"}
+	if c.CodexNetworkAccess && !c.CodexDocker {
+		args = append(args, "-c", "sandbox_workspace_write.network_access=true")
+	}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	args = append(args, "--sandbox", sandbox, "--cd", workDir, "--skip-git-repo-check")
+	return append(args, tail...)
+}
+
+func codexHomeDir(c config, requestID string) string {
+	return filepath.Join(c.OutputRoot, ".skill2api-codex", requestID, "home")
+}
+
+func newCodexCommand(ctx context.Context, c config, requestID, outputDir string, environment map[string]string, args []string) (*exec.Cmd, string, error) {
+	if !c.CodexDocker {
+		cmd := exec.CommandContext(ctx, c.CodexBin, args...)
+		cmd.Env = codexEnvironment(os.Environ(), environment, c.CodexNoProxy)
+		return cmd, c.CodexBin, nil
+	}
+	home := codexHomeDir(c, requestID)
+	if err := os.MkdirAll(home, 0700); err != nil {
+		return nil, c.CodexDockerBin, fmt.Errorf("create Codex home: %w", err)
+	}
+	dockerArgs := []string{"run", "--rm", "--init", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())}
+	if !c.CodexNetworkAccess {
+		dockerArgs = append(dockerArgs, "--network", "none")
+	}
+	dockerArgs = append(dockerArgs,
+		"--mount", "type=bind,src="+outputDir+",dst=/workspace",
+		"--mount", "type=bind,src="+home+",dst=/home/ubuntu",
+		"--workdir", "/workspace",
+		"--env", "HOME=/home/ubuntu",
+	)
+	keys := make([]string, 0, len(environment))
+	for key := range environment {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		dockerArgs = append(dockerArgs, "--env", key)
+	}
+	dockerArgs = append(dockerArgs, c.CodexDockerImage)
+	dockerArgs = append(dockerArgs, args...)
+	cmd := exec.CommandContext(ctx, c.CodexDockerBin, dockerArgs...)
+	cmd.Env = codexEnvironment(os.Environ(), environment, c.CodexNoProxy)
+	return cmd, c.CodexDockerBin, nil
 }
 
 func withoutProxyEnv(environ []string) []string {
@@ -707,21 +792,6 @@ func environmentRedactions(values map[string]string) []string {
 		return len(redactions[i]) > len(redactions[j])
 	})
 	return redactions
-}
-
-func codexCommandArgs(c config, model string, args []string) []string {
-	if len(args) == 0 {
-		return args
-	}
-	withOptions := make([]string, 0, len(args)+4)
-	withOptions = append(withOptions, args[0])
-	if c.CodexNetworkAccess {
-		withOptions = append(withOptions, "-c", "sandbox_workspace_write.network_access=true")
-	}
-	if model != "" {
-		withOptions = append(withOptions, "--model", model)
-	}
-	return append(withOptions, args[1:]...)
 }
 
 func openOutputLogs(outputDir string, appendLogs bool) (*os.File, *os.File, error) {
