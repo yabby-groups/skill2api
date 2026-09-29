@@ -108,9 +108,9 @@ type statusStore struct {
 }
 
 func newConfig() (config, error) {
-	addr := strings.TrimRight(strings.TrimSpace(firstEnv("GENERATION_PERIODIC_PORT", "PERIODIC_PORT")), "/")
+	addr := strings.TrimRight(strings.TrimSpace(os.Getenv("PERIODIC_PORT")), "/")
 	if addr == "" {
-		return config{}, errors.New("GENERATION_PERIODIC_PORT/PERIODIC_PORT is required")
+		return config{}, errors.New("PERIODIC_PORT is required")
 	}
 	root, err := filepath.Abs(strings.TrimSpace(os.Getenv("SKILL2API_OUTPUT_ROOT")))
 	if err != nil || root == "." || strings.TrimSpace(os.Getenv("SKILL2API_OUTPUT_ROOT")) == "" {
@@ -120,12 +120,12 @@ func newConfig() (config, error) {
 	if skills == "" {
 		skills = "skills"
 	}
-	mode, err := parseRSAMode(firstEnv("GENERATION_RSA_MODE", "PERIODIC_RSA_MODE"))
+	mode, err := parseRSAMode(os.Getenv("PERIODIC_RSA_MODE"))
 	if err != nil {
 		return config{}, err
 	}
-	priv := firstEnv("GENERATION_PRIVATE_KEY", "PERIODIC_RSA_PRIVATE_KEY_PATH")
-	pub := firstEnv("GENERATION_SERVER_PUBLIC_KEY", "PERIODIC_RSA_PUBLIC_KEY_PATH")
+	priv := strings.TrimSpace(os.Getenv("PERIODIC_RSA_PRIVATE_KEY_PATH"))
+	pub := strings.TrimSpace(os.Getenv("PERIODIC_RSA_PUBLIC_KEY_PATH"))
 	if mode != protocol.ModePlain && (priv == "" || pub == "") {
 		return config{}, errors.New("generation RSA key paths are required unless plain mode is selected")
 	}
@@ -137,16 +137,7 @@ func newConfig() (config, error) {
 	if limit < 1024 {
 		limit = 1024
 	}
-	return config{PeriodicAddr: addr, TaskPrefix: firstEnv("GENERATION_TASK_PREFIX", "TASK_PREFIX"), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), Timeout: timeout, MaxOutput: limit}, nil
-}
-
-func firstEnv(keys ...string) string {
-	for _, key := range keys {
-		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-			return v
-		}
-	}
-	return ""
+	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), Timeout: timeout, MaxOutput: limit}, nil
 }
 func firstEnvDefault(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {

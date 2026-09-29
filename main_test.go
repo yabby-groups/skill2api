@@ -142,12 +142,12 @@ func TestRunCodexExitAndTimeout(t *testing.T) {
 	}
 }
 
-func TestConfigPlainModeUsesGenerationSettings(t *testing.T) {
-	t.Setenv("GENERATION_PERIODIC_PORT", "tcp://periodic:5000")
-	t.Setenv("GENERATION_TASK_PREFIX", "generation-")
-	t.Setenv("GENERATION_RSA_MODE", "0")
-	t.Setenv("GENERATION_PRIVATE_KEY", "")
-	t.Setenv("GENERATION_SERVER_PUBLIC_KEY", "")
+func TestConfigPlainModeUsesPeriodicSettings(t *testing.T) {
+	t.Setenv("PERIODIC_PORT", "tcp://periodic:5000")
+	t.Setenv("TASK_PREFIX", "generation-")
+	t.Setenv("PERIODIC_RSA_MODE", "0")
+	t.Setenv("PERIODIC_RSA_PRIVATE_KEY_PATH", "")
+	t.Setenv("PERIODIC_RSA_PUBLIC_KEY_PATH", "")
 	t.Setenv("SKILL2API_OUTPUT_ROOT", t.TempDir())
 	c, err := newConfig()
 	if err != nil {
