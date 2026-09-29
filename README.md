@@ -24,6 +24,10 @@ periodic run skill2api_generate request-1 \
     "skill_name": "myna-health-check",
     "output_dir": "request-1",
     "prompt": "Generate the requested health-check package.",
+    "environment": {
+      "OPENAI_API_KEY": "provider-key-for-this-request"
+    },
+    "model": "gpt-6-sol",
     "force": false
   }' \
   --timeout 30
@@ -70,6 +74,20 @@ output changes: log tails are read only when `skill2api_status` is called.
 Caller-provided prompts and resume answers are redacted before either log is
 written. Codex session IDs are also redacted from public logs and status
 responses; the worker retains the ID privately for resume.
+
+## Per-request Environment and Model
+
+`skill2api_generate` accepts an optional `environment` object of environment
+variable names to values. Its values are passed only to the Codex subprocess;
+they are never saved in `status.json` or returned by `skill2api_status`.
+Values are redacted from the worker-managed stdout and stderr logs. The caller
+must provide any required variables again on every `skill2api_resume` request,
+because the worker does not persist them.
+
+`model` is an optional string on `skill2api_generate`. The worker passes it to
+`codex exec --model`, stores it with the task, includes it in status responses,
+and uses the same model for every resume. `skill2api_resume` does not accept a
+model override.
 
 ## Codex Execution Timeout
 
@@ -134,7 +152,7 @@ selected value. The same `skill2api_resume` endpoint also restores an
 
 ```bash
 periodic run skill2api_resume request-1 \
-  --workload '{"request_id":"request-1","answer":"v2"}' \
+  --workload '{"request_id":"request-1","answer":"v2","environment":{"OPENAI_API_KEY":"provider-key-for-this-request"}}' \
   --timeout 30
 ```
 

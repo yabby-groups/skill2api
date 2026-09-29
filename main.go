@@ -33,11 +33,13 @@ const (
 )
 
 type generateRequest struct {
-	RequestID string `json:"request_id"`
-	SkillName string `json:"skill_name"`
-	OutputDir string `json:"output_dir"`
-	Prompt    string `json:"prompt"`
-	Force     bool   `json:"force"`
+	RequestID   string            `json:"request_id"`
+	SkillName   string            `json:"skill_name"`
+	OutputDir   string            `json:"output_dir"`
+	Prompt      string            `json:"prompt"`
+	Environment map[string]string `json:"environment,omitempty"`
+	Model       string            `json:"model,omitempty"`
+	Force       bool              `json:"force"`
 }
 
 type statusRequest struct {
@@ -45,9 +47,10 @@ type statusRequest struct {
 }
 
 type resumeRequest struct {
-	RequestID   string `json:"request_id"`
-	Answer      string `json:"answer"`
-	Instruction string `json:"instruction"`
+	RequestID   string            `json:"request_id"`
+	Answer      string            `json:"answer"`
+	Instruction string            `json:"instruction"`
+	Environment map[string]string `json:"environment,omitempty"`
 }
 
 type terminateRequest struct {
@@ -62,6 +65,7 @@ type taskStatus struct {
 	FinishedAt string   `json:"finished_at"`
 	UpdatedAt  string   `json:"updated_at"`
 	SkillName  string   `json:"skill_name"`
+	Model      string   `json:"model,omitempty"`
 	OutputDir  string   `json:"output_dir"`
 	Files      []string `json:"files"`
 	Error      string   `json:"error"`
@@ -81,6 +85,7 @@ type statusResponse struct {
 	FinishedAt string   `json:"finished_at"`
 	UpdatedAt  string   `json:"updated_at"`
 	SkillName  string   `json:"skill_name"`
+	Model      string   `json:"model,omitempty"`
 	OutputDir  string   `json:"output_dir"`
 	Files      []string `json:"files"`
 	Error      string   `json:"error"`
@@ -94,7 +99,7 @@ type statusResponse struct {
 func publicStatus(v taskStatus) statusResponse {
 	return statusResponse{
 		RequestID: v.RequestID, Status: v.Status, CreatedAt: v.CreatedAt,
-		StartedAt: v.StartedAt, FinishedAt: v.FinishedAt, SkillName: v.SkillName,
+		StartedAt: v.StartedAt, FinishedAt: v.FinishedAt, SkillName: v.SkillName, Model: v.Model,
 		UpdatedAt: v.UpdatedAt,
 		OutputDir: v.OutputDir, Files: v.Files, Error: v.Error, Stdout: v.Stdout,
 		Stderr: v.Stderr, Phase: v.Phase, Question: v.Question, Options: v.Options,
@@ -432,6 +437,12 @@ func validateRequest(req generateRequest, c config) error {
 	if strings.TrimSpace(req.Prompt) == "" {
 		return errors.New("prompt is required")
 	}
+	if strings.TrimSpace(req.Model) != req.Model || strings.ContainsRune(req.Model, '\x00') {
+		return errors.New("invalid model")
+	}
+	if err := validateEnvironment(req.Environment); err != nil {
+		return err
+	}
 	if _, err := resolveOutputDir(req.OutputDir, c.OutputRoot); err != nil {
 		return err
 	}
@@ -446,6 +457,27 @@ func validateRequest(req generateRequest, c config) error {
 		return fmt.Errorf("skill not found: %w", err)
 	}
 	return nil
+}
+
+func validateEnvironment(values map[string]string) error {
+	for key, value := range values {
+		if !validEnvironmentName(key) || strings.ContainsRune(value, '\x00') {
+			return errors.New("invalid environment")
+		}
+	}
+	return nil
+}
+
+func validEnvironmentName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i, r := range value {
+		if !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func resolveOutputDir(raw, root string) (string, error) {
@@ -565,10 +597,11 @@ func codexPrompt(prompt string, skill []byte) string {
 }
 
 func runCodexWithSessionCallback(ctx context.Context, c config, req generateRequest, skill []byte, onSessionID func(string)) (string, string, string, error) {
-	return runCodexCommand(ctx, c, req.OutputDir, false, redactionLines(req.Prompt), onSessionID, []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", codexPrompt(req.Prompt, skill)})
+	redactions := append(redactionLines(req.Prompt), environmentRedactions(req.Environment)...)
+	return runCodexCommand(ctx, c, req.OutputDir, false, req.Environment, redactions, onSessionID, req.Model, []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", codexPrompt(req.Prompt, skill)})
 }
 
-func runCodexResume(ctx context.Context, c config, req taskStatus, answer, instruction string) (string, string, error) {
+func runCodexResume(ctx context.Context, c config, req taskStatus, answer, instruction string, environment map[string]string) (string, string, error) {
 	prompt := "Continue the original task."
 	if strings.TrimSpace(answer) != "" {
 		prompt = fmt.Sprintf("User answer to your pending question: %s\n\nContinue the original task.", answer)
@@ -578,11 +611,12 @@ func runCodexResume(ctx context.Context, c config, req taskStatus, answer, instr
 	}
 	prompt += "\n\nIf another clarification is required, end your response with exactly two lines: SKILL2API_INPUT_REQUIRED and then a JSON object containing question and optional options."
 	redactions := append(redactionLines(answer), redactionLines(instruction)...)
-	stdout, stderr, _, err := runCodexCommand(ctx, c, req.OutputDir, true, redactions, nil, []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", "resume", req.SessionID, prompt})
+	redactions = append(redactions, environmentRedactions(environment)...)
+	stdout, stderr, _, err := runCodexCommand(ctx, c, req.OutputDir, true, environment, redactions, nil, req.Model, []string{"exec", "--sandbox", "workspace-write", "--cd", req.OutputDir, "--skip-git-repo-check", "resume", req.SessionID, prompt})
 	return stdout, stderr, err
 }
 
-func runCodexCommand(ctx context.Context, c config, outputDir string, appendLogs bool, redactions []string, onSessionID func(string), args []string) (string, string, string, error) {
+func runCodexCommand(ctx context.Context, c config, outputDir string, appendLogs bool, environment map[string]string, redactions []string, onSessionID func(string), model string, args []string) (string, string, string, error) {
 	stdoutOffset, stderrOffset, err := outputLogOffsets(outputDir)
 	if err != nil {
 		return "", "", "", err
@@ -594,10 +628,8 @@ func runCodexCommand(ctx context.Context, c config, outputDir string, appendLogs
 	if err != nil {
 		return "", "", "", err
 	}
-	cmd := exec.CommandContext(ctx, c.CodexBin, codexCommandArgs(c, args)...)
-	if c.CodexNoProxy {
-		cmd.Env = withoutProxyEnv(os.Environ())
-	}
+	cmd := exec.CommandContext(ctx, c.CodexBin, codexCommandArgs(c, model, args)...)
+	cmd.Env = codexEnvironment(os.Environ(), environment, c.CodexNoProxy)
 	log.Printf("event=skill2api_codex_start output_dir=%s codex_bin=%s timeout=%s", outputDir, c.CodexBin, c.Timeout)
 	stdoutWriter := &redactingLogWriter{file: stdoutLog, redactions: redactions}
 	stderrWriter := &redactingLogWriter{file: stderrLog, redactions: redactions, onSessionID: onSessionID}
@@ -640,13 +672,56 @@ func withoutProxyEnv(environ []string) []string {
 	return filtered
 }
 
-func codexCommandArgs(c config, args []string) []string {
-	if !c.CodexNetworkAccess || len(args) == 0 {
+func codexEnvironment(environ []string, overrides map[string]string, noProxy bool) []string {
+	merged := append([]string(nil), environ...)
+	keys := make([]string, 0, len(overrides))
+	for key := range overrides {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		filtered := merged[:0]
+		for _, value := range merged {
+			current, _, _ := strings.Cut(value, "=")
+			if current != key {
+				filtered = append(filtered, value)
+			}
+		}
+		merged = append(filtered, key+"="+overrides[key])
+	}
+	if noProxy {
+		return withoutProxyEnv(merged)
+	}
+	return merged
+}
+
+func environmentRedactions(values map[string]string) []string {
+	var redactions []string
+	for _, value := range values {
+		redactions = append(redactions, redactionLines(value)...)
+	}
+	sort.Slice(redactions, func(i, j int) bool {
+		if len(redactions[i]) == len(redactions[j]) {
+			return redactions[i] < redactions[j]
+		}
+		return len(redactions[i]) > len(redactions[j])
+	})
+	return redactions
+}
+
+func codexCommandArgs(c config, model string, args []string) []string {
+	if len(args) == 0 {
 		return args
 	}
-	withNetworkAccess := make([]string, 0, len(args)+2)
-	withNetworkAccess = append(withNetworkAccess, args[0], "-c", "sandbox_workspace_write.network_access=true")
-	return append(withNetworkAccess, args[1:]...)
+	withOptions := make([]string, 0, len(args)+4)
+	withOptions = append(withOptions, args[0])
+	if c.CodexNetworkAccess {
+		withOptions = append(withOptions, "-c", "sandbox_workspace_write.network_access=true")
+	}
+	if model != "" {
+		withOptions = append(withOptions, "--model", model)
+	}
+	return append(withOptions, args[1:]...)
 }
 
 func openOutputLogs(outputDir string, appendLogs bool) (*os.File, *os.File, error) {
@@ -936,7 +1011,7 @@ func executeResume(store *statusStore, manager *taskManager, c config, req resum
 		return
 	}
 	var err error
-	stdout, _, err := runCodexResume(ctx, c, v, req.Answer, req.Instruction)
+	stdout, _, err := runCodexResume(ctx, c, v, req.Answer, req.Instruction, req.Environment)
 	cancel()
 	if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
 		return
@@ -1008,7 +1083,7 @@ func handleGenerate(job periodic.Job, store *statusStore, manager *taskManager, 
 	}
 	req.OutputDir = outputDir
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	v := taskStatus{RequestID: req.RequestID, Status: "queued", CreatedAt: now, SkillName: req.SkillName, OutputDir: req.OutputDir}
+	v := taskStatus{RequestID: req.RequestID, Status: "queued", CreatedAt: now, SkillName: req.SkillName, Model: req.Model, OutputDir: req.OutputDir}
 	if err := store.create(v, req.Force); err != nil {
 		log.Printf("event=skill2api_generate request_id=%s result=duplicate error=%q", req.RequestID, err)
 		_ = job.Fail()
@@ -1072,6 +1147,10 @@ func handleResume(job periodic.Job, store *statusStore, manager *taskManager, c 
 		return
 	}
 	if !validID(req.RequestID) || (strings.TrimSpace(req.Answer) != "" && strings.TrimSpace(req.Instruction) != "") {
+		_ = job.Fail()
+		return
+	}
+	if err := validateEnvironment(req.Environment); err != nil {
 		_ = job.Fail()
 		return
 	}

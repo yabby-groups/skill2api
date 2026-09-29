@@ -38,6 +38,9 @@ func TestValidateRequestRejectsTraversalAndOutsideOutput(t *testing.T) {
 		{RequestID: "ok", SkillName: "../demo", OutputDir: base.OutputDir, Prompt: base.Prompt},
 		{RequestID: "ok", SkillName: "demo", OutputDir: "../outside", Prompt: base.Prompt},
 		{RequestID: "ok", SkillName: "demo", OutputDir: filepath.Join(root, "request-1"), Prompt: base.Prompt},
+		{RequestID: "ok", SkillName: "demo", OutputDir: base.OutputDir, Prompt: base.Prompt, Model: " model"},
+		{RequestID: "ok", SkillName: "demo", OutputDir: base.OutputDir, Prompt: base.Prompt, Environment: map[string]string{"NOT-VALID": "value"}},
+		{RequestID: "ok", SkillName: "demo", OutputDir: base.OutputDir, Prompt: base.Prompt, Environment: map[string]string{"VALID": "value\x00"}},
 	} {
 		if err := validateRequest(req, c); err == nil {
 			t.Fatalf("request %#v was accepted", req)
@@ -144,12 +147,31 @@ func TestWithoutProxyEnvRemovesProxyVariablesOnly(t *testing.T) {
 
 func TestCodexCommandArgsEnablesWorkspaceNetworkOnlyWhenConfigured(t *testing.T) {
 	args := []string{"exec", "--sandbox", "workspace-write", "prompt"}
-	if got := codexCommandArgs(config{}, args); !reflect.DeepEqual(got, args) {
+	if got := codexCommandArgs(config{}, "", args); !reflect.DeepEqual(got, args) {
 		t.Fatalf("network-disabled args = %#v, want %#v", got, args)
 	}
 	want := []string{"exec", "-c", "sandbox_workspace_write.network_access=true", "--sandbox", "workspace-write", "prompt"}
-	if got := codexCommandArgs(config{CodexNetworkAccess: true}, args); !reflect.DeepEqual(got, want) {
+	if got := codexCommandArgs(config{CodexNetworkAccess: true}, "", args); !reflect.DeepEqual(got, want) {
 		t.Fatalf("network-enabled args = %#v, want %#v", got, want)
+	}
+	want = []string{"exec", "-c", "sandbox_workspace_write.network_access=true", "--model", "gpt-6-sol", "--sandbox", "workspace-write", "prompt"}
+	if got := codexCommandArgs(config{CodexNetworkAccess: true}, "gpt-6-sol", args); !reflect.DeepEqual(got, want) {
+		t.Fatalf("model args = %#v, want %#v", got, want)
+	}
+}
+
+func TestCodexEnvironmentOverlaysAndFiltersProxy(t *testing.T) {
+	got := codexEnvironment([]string{"PATH=/bin", "KEEP=old", "HTTP_PROXY=old-proxy"}, map[string]string{"KEEP": "new", "TOKEN": "secret", "http_proxy": "request-proxy"}, true)
+	want := []string{"PATH=/bin", "KEEP=new", "TOKEN=secret"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("merged environment = %#v, want %#v", got, want)
+	}
+}
+
+func TestEnvironmentValuesAreRedacted(t *testing.T) {
+	got := environmentRedactions(map[string]string{"TOKEN": "first\nsecond", "EMPTY": "", "PREFIX": "first-value"})
+	if !reflect.DeepEqual(got, []string{"first-value", "second", "first"}) {
+		t.Fatalf("environment redactions = %#v", got)
 	}
 }
 
@@ -242,13 +264,16 @@ func TestTaskManagerCancel(t *testing.T) {
 	manager.unregister("r1")
 }
 
-func TestPublicStatusDoesNotExposeSession(t *testing.T) {
-	data, err := json.Marshal(publicStatus(taskStatus{RequestID: "r1", Status: "waiting_for_input", SessionID: "secret"}))
+func TestPublicStatusExposesModelButNotSession(t *testing.T) {
+	data, err := json.Marshal(publicStatus(taskStatus{RequestID: "r1", Status: "waiting_for_input", Model: "gpt-6-sol", SessionID: "secret"}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(data), "secret") || strings.Contains(string(data), "session_id") {
 		t.Fatalf("session leaked in public status: %s", data)
+	}
+	if !strings.Contains(string(data), `"model":"gpt-6-sol"`) {
+		t.Fatalf("model missing from public status: %s", data)
 	}
 }
 
@@ -320,7 +345,7 @@ func TestRunCodexResumeAppendsLogs(t *testing.T) {
 	if _, _, err := runCodex(context.Background(), c, generateRequest{OutputDir: out}, nil); err != nil {
 		t.Fatal(err)
 	}
-	stdoutTail, stderrTail, err := runCodexResume(context.Background(), c, taskStatus{OutputDir: out, SessionID: "session-1"}, "answer", "")
+	stdoutTail, stderrTail, err := runCodexResume(context.Background(), c, taskStatus{OutputDir: out, SessionID: "session-1"}, "answer", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +447,7 @@ func TestRunCodexRedactsPromptAndResumeAnswerFromLogs(t *testing.T) {
 	} else if sessionID != "private-session-1" {
 		t.Fatalf("unexpected private session ID: %q", sessionID)
 	}
-	if _, _, err := runCodexResume(context.Background(), c, taskStatus{OutputDir: out, SessionID: "session-1"}, "secret answer value", "secret instruction value"); err != nil {
+	if _, _, err := runCodexResume(context.Background(), c, taskStatus{OutputDir: out, SessionID: "session-1"}, "secret answer value", "secret instruction value", nil); err != nil {
 		t.Fatal(err)
 	}
 	stdout, err := os.ReadFile(filepath.Join(out, stdoutLogName))
@@ -438,6 +463,42 @@ func TestRunCodexRedactsPromptAndResumeAnswerFromLogs(t *testing.T) {
 	}
 	if strings.Count(string(stderr), "[redacted]") != 5 {
 		t.Fatalf("expected inputs and session IDs to be redacted: %q", stderr)
+	}
+}
+
+func TestRunCodexPassesEnvironmentAndModelWithoutLeakingValue(t *testing.T) {
+	c, root := testConfig(t)
+	bin := filepath.Join(root, "fake-codex")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf '%s|%s\\n' \"$SKILL2API_TEST_SECRET\" \"$*\"\nprintf '%s\\n' \"$SKILL2API_TEST_SECRET\" >&2\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c.CodexBin = bin
+	c.MaxOutput = 4096
+	out := filepath.Join(root, "request-1")
+	if err := os.MkdirAll(out, 0750); err != nil {
+		t.Fatal(err)
+	}
+	req := generateRequest{OutputDir: out, Prompt: "ordinary prompt", Model: "gpt-6-sol", Environment: map[string]string{"SKILL2API_TEST_SECRET": "private-value"}}
+	stdout, stderr, err := runCodex(context.Background(), c, req, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout, "private-value") || strings.Contains(stderr, "private-value") {
+		t.Fatalf("environment value leaked in returned output: stdout=%q stderr=%q", stdout, stderr)
+	}
+	if !strings.Contains(stdout, "--model gpt-6-sol") {
+		t.Fatalf("model argument missing from initial run: %q", stdout)
+	}
+	stdout, stderr, err = runCodexResume(context.Background(), c, taskStatus{OutputDir: out, SessionID: "session-1", Model: "gpt-6-sol"}, "answer", "", map[string]string{"SKILL2API_TEST_SECRET": "private-value"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout, "private-value") || strings.Contains(stderr, "private-value") || !strings.Contains(stdout, "--model gpt-6-sol") {
+		t.Fatalf("resume did not preserve model or redact environment: stdout=%q stderr=%q", stdout, stderr)
+	}
+	stderrLog, err := os.ReadFile(filepath.Join(out, stderrLogName))
+	if err != nil || strings.Contains(string(stderrLog), "private-value") {
+		t.Fatalf("environment value leaked in stderr log: %q err=%v", stderrLog, err)
 	}
 }
 
