@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,20 +27,24 @@ import (
 )
 
 const (
-	generateFunc      = "skill2api_generate"
-	statusFunc        = "skill2api_status"
-	fileFunc          = "skill2api_file"
-	resumeFunc        = "skill2api_resume"
-	terminateFunc     = "skill2api_terminate"
-	cleanupFunc       = "skill2api_cleanup"
-	maxOutput         = 64 * 1024
-	maxFileBytes      = 64 * 1024 * 1024
-	maxSkillName      = 128
-	retentionAge      = 24 * time.Hour
-	stdoutLogName     = "stdout.log"
-	stderrLogName     = "stderr.log"
-	maxInputTailBytes = 16 * 1024
-	dockerCodexConfig = `sandbox_mode = "danger-full-access"
+	generateFunc           = "skill2api_generate"
+	statusFunc             = "skill2api_status"
+	fileFunc               = "skill2api_file"
+	fileDeliveryFunc       = "skill2api_file_delivery"
+	fileDeliveryStatusFunc = "skill2api_file_delivery_status"
+	resumeFunc             = "skill2api_resume"
+	terminateFunc          = "skill2api_terminate"
+	cleanupFunc            = "skill2api_cleanup"
+	maxOutput              = 64 * 1024
+	maxFileBytes           = 64 * 1024 * 1024
+	maxSkillName           = 128
+	retentionAge           = 24 * time.Hour
+	stdoutLogName          = "stdout.log"
+	stderrLogName          = "stderr.log"
+	maxInputTailBytes      = 16 * 1024
+	fileUploadTimeout      = 45 * time.Second
+	fileUploadAttempts     = 3
+	dockerCodexConfig      = `sandbox_mode = "danger-full-access"
 model_provider = "sandbox_runner"
 model = "gpt-5.6-luna"
 
@@ -72,6 +78,34 @@ type fileRequest struct {
 	RequestID   string            `json:"request_id"`
 	FilePath    string            `json:"file_path"`
 	Environment map[string]string `json:"environment"`
+}
+
+type fileDeliveryRequest struct {
+	RequestID   string            `json:"request_id"`
+	DeliveryID  string            `json:"delivery_id"`
+	FilePath    string            `json:"file_path"`
+	Environment map[string]string `json:"environment"`
+}
+
+type fileDeliveryStatusRequest struct {
+	RequestID  string `json:"request_id"`
+	DeliveryID string `json:"delivery_id"`
+}
+
+type fileDeliveryStatus struct {
+	RequestID        string          `json:"request_id"`
+	DeliveryID       string          `json:"delivery_id"`
+	SharedDeliveryID string          `json:"shared_delivery_id,omitempty"`
+	FilePath         string          `json:"file_path"`
+	FileKey          string          `json:"file_key,omitempty"`
+	Status           string          `json:"status"`
+	CreatedAt        string          `json:"created_at"`
+	UpdatedAt        string          `json:"updated_at"`
+	FinishedAt       string          `json:"finished_at,omitempty"`
+	Attempts         int             `json:"attempts"`
+	File             json.RawMessage `json:"file,omitempty"`
+	URL              string          `json:"url,omitempty"`
+	Error            string          `json:"error,omitempty"`
 }
 
 type resumeRequest struct {
@@ -304,6 +338,15 @@ func parseRSAMode(raw string) (int, error) {
 func withPrefix(prefix, fn string) string { return strings.TrimSpace(prefix) + fn }
 
 func (s *statusStore) path(id string) string { return filepath.Join(s.root, id, "status.json") }
+func (s *statusStore) deliveryDir(id string) string {
+	return filepath.Join(s.root, id, ".skill2api-deliveries")
+}
+func (s *statusStore) deliveryPath(requestID, deliveryID string) string {
+	return filepath.Join(s.deliveryDir(requestID), deliveryID+".json")
+}
+func (s *statusStore) deliveryKeyPath(requestID, fileKey string) string {
+	return filepath.Join(s.deliveryDir(requestID), "key-"+fileKey+".json")
+}
 func (s *statusStore) read(id string) (taskStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -351,6 +394,91 @@ func (s *statusStore) writeUnlocked(v taskStatus) error {
 		return err
 	}
 	return os.Rename(name, s.path(v.RequestID))
+}
+
+func readDeliveryFile(path string) (fileDeliveryStatus, error) {
+	var out fileDeliveryStatus
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return out, err
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return out, fmt.Errorf("invalid file delivery status: %w", err)
+	}
+	return out, nil
+}
+
+func writeDeliveryFile(path string, value fileDeliveryStatus) error {
+	value.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".delivery-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if err = tmp.Chmod(0600); err == nil {
+		_, err = tmp.Write(data)
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(name, path)
+}
+
+func (s *statusStore) startDelivery(value fileDeliveryStatus) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keyPath := s.deliveryKeyPath(value.RequestID, value.FileKey)
+	if current, err := readDeliveryFile(keyPath); err == nil &&
+		(current.Status == "queued" || current.Status == "running" || current.Status == "succeeded") {
+		value.Status = current.Status
+		value.SharedDeliveryID = current.DeliveryID
+		value.File = current.File
+		value.URL = current.URL
+		value.Error = current.Error
+		value.Attempts = current.Attempts
+		return false, writeDeliveryFile(s.deliveryPath(value.RequestID, value.DeliveryID), value)
+	}
+	if err := writeDeliveryFile(s.deliveryPath(value.RequestID, value.DeliveryID), value); err != nil {
+		return false, err
+	}
+	return true, writeDeliveryFile(keyPath, value)
+}
+
+func (s *statusStore) finishDelivery(value fileDeliveryStatus) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := writeDeliveryFile(s.deliveryPath(value.RequestID, value.DeliveryID), value); err != nil {
+		return err
+	}
+	return writeDeliveryFile(s.deliveryKeyPath(value.RequestID, value.FileKey), value)
+}
+
+func (s *statusStore) readDelivery(requestID, deliveryID string) (fileDeliveryStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, err := readDeliveryFile(s.deliveryPath(requestID, deliveryID))
+	if err != nil || value.SharedDeliveryID == "" {
+		return value, err
+	}
+	shared, err := readDeliveryFile(s.deliveryKeyPath(requestID, value.FileKey))
+	if err != nil {
+		return value, err
+	}
+	shared.DeliveryID = deliveryID
+	shared.SharedDeliveryID = value.SharedDeliveryID
+	shared.FilePath = value.FilePath
+	return shared, nil
 }
 
 func (s *statusStore) create(v taskStatus, force bool) error {
@@ -1183,6 +1311,9 @@ func listFiles(dir string) ([]string, error) {
 		if err != nil {
 			return err
 		}
+		if info.IsDir() && info.Name() == ".skill2api-deliveries" {
+			return filepath.SkipDir
+		}
 		if !info.IsDir() {
 			rel, e := filepath.Rel(dir, path)
 			if e != nil {
@@ -1266,6 +1397,73 @@ type uploadedFile struct {
 	FileExt string `json:"file_ext"`
 }
 
+type uploadRequestError struct {
+	err       error
+	retryable bool
+}
+
+func (e *uploadRequestError) Error() string { return e.err.Error() }
+func (e *uploadRequestError) Unwrap() error { return e.err }
+
+func fileKeyForData(data []byte) string {
+	sum := sha256.Sum256(data)
+	return strings.ReplaceAll(base64.RawURLEncoding.EncodeToString(sum[:]), "-", "")
+}
+
+func isRetryableUploadError(err error) bool {
+	var requestErr *uploadRequestError
+	if errors.As(err, &requestErr) {
+		return requestErr.retryable
+	}
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+func resolveTemporaryFile(ctx context.Context, c config, apiKey, fileKey string) (json.RawMessage, string, bool, error) {
+	body, err := json.Marshal(map[string]string{"file_key": fileKey})
+	if err != nil {
+		return nil, "", false, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.UploadBaseURL+"/api/file/temporary/resolve/", bytes.NewReader(body))
+	if err != nil {
+		return nil, "", false, fmt.Errorf("create temporary file resolve request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+apiKey)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return nil, "", false, &uploadRequestError{err: fmt.Errorf("resolve temporary file: %w", err), retryable: true}
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, int64(maxOutput)+1))
+	if err != nil {
+		return nil, "", false, fmt.Errorf("read temporary file resolve response: %w", err)
+	}
+	if len(responseBody) > maxOutput {
+		return nil, "", false, errors.New("temporary file resolve response exceeds maximum size")
+	}
+	if response.StatusCode == http.StatusNotFound {
+		return nil, "", false, nil
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return nil, "", false, &uploadRequestError{
+			err:       fmt.Errorf("resolve temporary file returned HTTP %d", response.StatusCode),
+			retryable: response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError,
+		}
+	}
+	var payload struct {
+		File json.RawMessage `json:"file"`
+		URL  string          `json:"url"`
+	}
+	if err := json.Unmarshal(responseBody, &payload); err != nil {
+		return nil, "", false, fmt.Errorf("decode temporary file resolve response: %w", err)
+	}
+	var file uploadedFile
+	if len(payload.File) == 0 || json.Unmarshal(payload.File, &file) != nil || file.FileKey != fileKey || len(file.FileKey) < 4 || strings.TrimSpace(file.FileExt) == "" || strings.TrimSpace(payload.URL) == "" {
+		return nil, "", false, errors.New("temporary file resolve response did not contain the requested file")
+	}
+	return payload.File, payload.URL, true, nil
+}
+
 func uploadTemporaryFile(ctx context.Context, c config, req fileRequest, data []byte) (json.RawMessage, string, error) {
 	if err := validateEnvironment(req.Environment); err != nil {
 		return nil, "", err
@@ -1273,6 +1471,12 @@ func uploadTemporaryFile(ctx context.Context, c config, req fileRequest, data []
 	apiKey := strings.TrimSpace(req.Environment["SANDBOX_AI_KEY"])
 	if apiKey == "" {
 		return nil, "", errors.New("SANDBOX_AI_KEY is required for file upload")
+	}
+	fileKey := fileKeyForData(data)
+	if file, uploadURL, found, err := resolveTemporaryFile(ctx, c, apiKey, fileKey); err != nil {
+		return nil, "", err
+	} else if found {
+		return file, uploadURL, nil
 	}
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -1300,7 +1504,7 @@ func uploadTemporaryFile(ctx context.Context, c config, req fileRequest, data []
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
-		return nil, "", fmt.Errorf("upload temporary file: %w", err)
+		return nil, "", &uploadRequestError{err: fmt.Errorf("upload temporary file: %w", err), retryable: true}
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, int64(maxOutput)+1))
@@ -1316,18 +1520,45 @@ func uploadTemporaryFile(ctx context.Context, c config, req fileRequest, data []
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		if payload.Err != "" {
-			return nil, "", fmt.Errorf("upload temporary file: %s", payload.Err)
+			return nil, "", &uploadRequestError{
+				err:       fmt.Errorf("upload temporary file: %s", payload.Err),
+				retryable: response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError,
+			}
 		}
-		return nil, "", fmt.Errorf("upload temporary file returned HTTP %d", response.StatusCode)
+		return nil, "", &uploadRequestError{
+			err:       fmt.Errorf("upload temporary file returned HTTP %d", response.StatusCode),
+			retryable: response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError,
+		}
 	}
 	var uploaded uploadedFile
 	if len(payload.File) == 0 || json.Unmarshal(payload.File, &uploaded) != nil || len(uploaded.FileKey) < 4 || strings.TrimSpace(uploaded.FileExt) == "" {
 		return nil, "", errors.New("upload response did not contain a valid file")
 	}
-	fileKey := url.PathEscape(uploaded.FileKey)
+	if uploaded.FileKey != fileKeyForData(data) {
+		return nil, "", errors.New("upload response file_key did not match file content")
+	}
+	fileKey = url.PathEscape(uploaded.FileKey)
 	fileExt := url.PathEscape(strings.TrimPrefix(uploaded.FileExt, "."))
 	path := fmt.Sprintf("/upload/%s/%s/%s.%s", fileKey[:2], fileKey[2:4], fileKey, fileExt)
 	return payload.File, path, nil
+}
+
+func uploadTemporaryFileWithRetry(c config, req fileRequest, data []byte) (json.RawMessage, string, int, error) {
+	var lastErr error
+	for attempt := 1; attempt <= fileUploadAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), fileUploadTimeout)
+		file, uploadURL, err := uploadTemporaryFile(ctx, c, req, data)
+		cancel()
+		if err == nil {
+			return file, uploadURL, attempt, nil
+		}
+		lastErr = err
+		if !isRetryableUploadError(err) || attempt == fileUploadAttempts {
+			break
+		}
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+	return nil, "", fileUploadAttempts, lastErr
 }
 
 func execute(store *statusStore, manager *taskManager, c config, req generateRequest) {
@@ -1595,7 +1826,9 @@ func handleFile(job periodic.Job, store *statusStore, c config) {
 		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "failed", "error": err.Error()})
 		return
 	}
-	file, uploadURL, err := uploadTemporaryFile(context.Background(), c, req, data)
+	ctx, cancel := context.WithTimeout(context.Background(), fileUploadTimeout)
+	file, uploadURL, err := uploadTemporaryFile(ctx, c, req, data)
+	cancel()
 	if err != nil {
 		log.Printf("event=skill2api_file request_id=%s result=upload_failed error=%q", req.RequestID, err)
 		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "failed", "error": err.Error()})
@@ -1603,6 +1836,80 @@ func handleFile(job periodic.Job, store *statusStore, c config) {
 	}
 	log.Printf("event=skill2api_file request_id=%s result=uploaded bytes=%d", req.RequestID, len(data))
 	doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "succeeded", "file": file, "url": uploadURL})
+}
+
+func handleFileDelivery(job periodic.Job, store *statusStore, c config) {
+	var req fileDeliveryRequest
+	if err := parseArgs(job, &req); err != nil {
+		doneJSON(job, map[string]any{"delivery_id": job.Name, "status": "failed", "error": "invalid file delivery request"})
+		return
+	}
+	if strings.TrimSpace(req.DeliveryID) == "" {
+		req.DeliveryID = job.Name
+	}
+	if req.DeliveryID != job.Name || !validID(req.DeliveryID) || !validID(req.RequestID) {
+		doneJSON(job, map[string]any{"delivery_id": job.Name, "status": "failed", "error": "invalid delivery identifier"})
+		return
+	}
+	v, err := store.read(req.RequestID)
+	if err != nil {
+		doneJSON(job, map[string]any{"request_id": req.RequestID, "delivery_id": req.DeliveryID, "status": "not_found", "error": "request not found"})
+		return
+	}
+	data, err := readTaskFile(v.OutputDir, req.FilePath, c.MaxFileBytes)
+	if err != nil {
+		doneJSON(job, map[string]any{"request_id": req.RequestID, "delivery_id": req.DeliveryID, "status": "failed", "error": err.Error()})
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	delivery := fileDeliveryStatus{
+		RequestID: req.RequestID, DeliveryID: req.DeliveryID, FilePath: req.FilePath,
+		FileKey: fileKeyForData(data), Status: "running", CreatedAt: now,
+	}
+	execute, err := store.startDelivery(delivery)
+	if err != nil {
+		doneJSON(job, map[string]any{"request_id": req.RequestID, "delivery_id": req.DeliveryID, "status": "failed", "error": err.Error()})
+		return
+	}
+	if !execute {
+		log.Printf("event=skill2api_file_delivery request_id=%s delivery_id=%s result=reused file_key=%s", req.RequestID, req.DeliveryID, delivery.FileKey)
+		doneJSON(job, delivery)
+		return
+	}
+	file, uploadURL, attempts, uploadErr := uploadTemporaryFileWithRetry(c, fileRequest{
+		RequestID: req.RequestID, FilePath: req.FilePath, Environment: req.Environment,
+	}, data)
+	delivery.Attempts = attempts
+	delivery.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	if uploadErr != nil {
+		delivery.Status, delivery.Error = "failed", uploadErr.Error()
+		log.Printf("event=skill2api_file_delivery request_id=%s delivery_id=%s result=failed attempts=%d error=%q", req.RequestID, req.DeliveryID, attempts, uploadErr)
+	} else {
+		delivery.Status, delivery.File, delivery.URL = "succeeded", file, uploadURL
+		log.Printf("event=skill2api_file_delivery request_id=%s delivery_id=%s result=succeeded attempts=%d file_key=%s", req.RequestID, req.DeliveryID, attempts, delivery.FileKey)
+	}
+	if err := store.finishDelivery(delivery); err != nil {
+		delivery.Status, delivery.Error = "failed", err.Error()
+	}
+	doneJSON(job, delivery)
+}
+
+func handleFileDeliveryStatus(job periodic.Job, store *statusStore) {
+	var req fileDeliveryStatusRequest
+	if err := parseArgs(job, &req); err != nil || req.DeliveryID != job.Name || !validID(req.RequestID) || !validID(req.DeliveryID) {
+		doneJSON(job, map[string]any{"delivery_id": job.Name, "status": "failed", "error": "invalid file delivery status request"})
+		return
+	}
+	delivery, err := store.readDelivery(req.RequestID, req.DeliveryID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			doneJSON(job, map[string]any{"request_id": req.RequestID, "delivery_id": req.DeliveryID, "status": "queued"})
+			return
+		}
+		doneJSON(job, map[string]any{"request_id": req.RequestID, "delivery_id": req.DeliveryID, "status": "failed", "error": "read file delivery status"})
+		return
+	}
+	doneJSON(job, delivery)
 }
 
 func handleResume(job periodic.Job, store *statusStore, manager *taskManager, c config) {
@@ -1774,6 +2081,12 @@ func registerWorkerFuncs(worker *periodic.Worker, prefix string, store *statusSt
 		return err
 	}
 	if err := addWorkerFunc(worker, prefix, fileFunc, func(job periodic.Job) { handleFile(job, store, c) }); err != nil {
+		return err
+	}
+	if err := addWorkerFunc(worker, prefix, fileDeliveryFunc, func(job periodic.Job) { handleFileDelivery(job, store, c) }); err != nil {
+		return err
+	}
+	if err := addWorkerFunc(worker, prefix, fileDeliveryStatusFunc, func(job periodic.Job) { handleFileDeliveryStatus(job, store) }); err != nil {
 		return err
 	}
 	if err := addWorkerFunc(worker, prefix, resumeFunc, func(job periodic.Job) { handleResume(job, store, manager, c) }); err != nil {

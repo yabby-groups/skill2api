@@ -8,7 +8,9 @@ user decision.
 
 - The Periodic service is running.
 - The Skill2API worker registers `skill2api_generate`, `skill2api_status`,
-  `skill2api_file`, `skill2api_resume`, `skill2api_terminate`, and `skill2api_cleanup`.
+  `skill2api_file`, `skill2api_file_delivery`,
+  `skill2api_file_delivery_status`, `skill2api_resume`,
+  `skill2api_terminate`, and `skill2api_cleanup`.
 - `skill_name` resolves to `SKILL2API_SKILLS_DIR/<skill_name>/SKILL.md`.
 - `output_dir` is a relative path inside `SKILL2API_OUTPUT_ROOT`.
 
@@ -98,6 +100,25 @@ clients receive the unencoded job data directly.
 
 `SKILL2API_MAX_FILE_BYTES` limits one read and defaults to 67108864 bytes
 (64 MiB). Files over the limit are rejected without returning partial data.
+
+## Asynchronous Temporary Delivery
+
+`skill2api_file_delivery` uploads one task output without holding an HTTP
+caller open. Its Periodic job name and `delivery_id` must match; its workload
+also includes the source `request_id`, `file_path`, and worker-only
+`environment`.
+
+Before transferring bytes, the worker derives the Myna-compatible `file_key`
+from the output and resolves any unexpired temporary object with that key.
+Resolved content is reused globally. Otherwise the worker attempts the
+temporary upload up to three times, with a 45-second limit per attempt.
+
+Poll `skill2api_file_delivery_status` with the same delivery job name and a
+workload containing `request_id` and `delivery_id`. It returns `queued`,
+`running`, `succeeded`, or `failed`; successful responses include
+the temporary file metadata and relative download URL. Delivery state is kept
+in the source request's internal delivery directory and is removed with the
+normal request cleanup.
 
 ## Per-request Environment and Model
 

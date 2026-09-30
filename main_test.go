@@ -106,6 +106,11 @@ func TestListFilesOrdersByModificationTime(t *testing.T) {
 
 func TestUploadTemporaryFileUsesTokenCredentialAndReturnsRelativeURL(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/file/temporary/resolve/" && r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"err":"temporary file not found"}`))
+			return
+		}
 		if r.URL.Path != "/api/file/run/" || r.Method != http.MethodPost {
 			t.Fatalf("unexpected upload request: %s %s", r.Method, r.URL.Path)
 		}
@@ -127,7 +132,7 @@ func TestUploadTemporaryFileUsesTokenCredentialAndReturnsRelativeURL(t *testing.
 		if err != nil || header.Filename != "result.mp4" || !bytes.Equal(data, []byte("video")) {
 			t.Fatalf("unexpected upload file: name=%q data=%q err=%v", header.Filename, data, err)
 		}
-		_, _ = w.Write([]byte(`{"file":{"file_key":"abcdef","file_ext":"mp4"}}`))
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"file":{"file_key":%q,"file_ext":"mp4"}}`, fileKeyForData([]byte("video")))))
 	}))
 	defer server.Close()
 
@@ -138,8 +143,73 @@ func TestUploadTemporaryFileUsesTokenCredentialAndReturnsRelativeURL(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(file) != `{"file_key":"abcdef","file_ext":"mp4"}` || uploadURL != "/upload/ab/cd/abcdef.mp4" {
+	key := fileKeyForData([]byte("video"))
+	if string(file) != fmt.Sprintf(`{"file_key":%q,"file_ext":"mp4"}`, key) || uploadURL != fmt.Sprintf("/upload/%s/%s/%s.mp4", key[:2], key[2:4], key) {
 		t.Fatalf("unexpected upload result: file=%s url=%q", file, uploadURL)
+	}
+}
+
+func TestUploadTemporaryFileReusesResolvedContent(t *testing.T) {
+	key := fileKeyForData([]byte("video"))
+	uploaded := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/file/temporary/resolve/":
+			if r.Method != http.MethodPost {
+				t.Fatalf("unexpected resolver method: %s", r.Method)
+			}
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"file":{"file_key":%q,"file_ext":"mp4","expires_at":9999},"url":"/upload/%s/%s/%s.mp4"}`, key, key[:2], key[2:4], key)))
+		case "/api/file/run/":
+			uploaded = true
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	file, uploadURL, err := uploadTemporaryFile(context.Background(), config{UploadBaseURL: server.URL}, fileRequest{
+		FilePath:    "outputs/result.mp4",
+		Environment: map[string]string{"SANDBOX_AI_KEY": "private-key"},
+	}, []byte("video"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uploaded || string(file) == "" || uploadURL != fmt.Sprintf("/upload/%s/%s/%s.mp4", key[:2], key[2:4], key) {
+		t.Fatalf("resolved content was not reused: uploaded=%t file=%s url=%q", uploaded, file, uploadURL)
+	}
+}
+
+func TestDeliveryStatusSharesContentKeyState(t *testing.T) {
+	store := &statusStore{root: t.TempDir()}
+	first := fileDeliveryStatus{
+		RequestID: "request-1", DeliveryID: "delivery-1", FilePath: "source.mp4",
+		FileKey: "shared-key", Status: "running", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	execute, err := store.startDelivery(first)
+	if err != nil || !execute {
+		t.Fatalf("first delivery start = (%t, %v), want (true, nil)", execute, err)
+	}
+	second := fileDeliveryStatus{
+		RequestID: "request-1", DeliveryID: "delivery-2", FilePath: "source.mp4",
+		FileKey: "shared-key", Status: "running", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	execute, err = store.startDelivery(second)
+	if err != nil || execute {
+		t.Fatalf("second delivery start = (%t, %v), want (false, nil)", execute, err)
+	}
+	first.Status = "succeeded"
+	first.File = json.RawMessage(`{"file_key":"shared-key","file_ext":"mp4"}`)
+	first.URL = "/upload/sh/ar/shared-key.mp4"
+	if err := store.finishDelivery(first); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.readDelivery("request-1", "delivery-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "succeeded" || got.URL != first.URL || got.DeliveryID != "delivery-2" {
+		t.Fatalf("shared delivery = %#v", got)
 	}
 }
 
