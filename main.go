@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,8 +68,9 @@ type statusRequest struct {
 }
 
 type fileRequest struct {
-	RequestID string `json:"request_id"`
-	FilePath  string `json:"file_path"`
+	RequestID   string            `json:"request_id"`
+	FilePath    string            `json:"file_path"`
+	Environment map[string]string `json:"environment"`
 }
 
 type resumeRequest struct {
@@ -161,6 +165,7 @@ type config struct {
 	CodexDockerImage  string
 	CodexDockerOptDir string
 	CodexNoProxy      bool
+	UploadBaseURL     string
 	Timeout           time.Duration
 	MaxOutput         int
 	MaxFileBytes      int
@@ -258,7 +263,12 @@ func newConfig() (config, error) {
 			return config{}, errors.New("SKILL2API_CODEX_DOCKER_OPT_DIR must be an existing directory")
 		}
 	}
-	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexDockerOptDir: optDir, CodexNoProxy: noProxy, Timeout: timeout, MaxOutput: limit, MaxFileBytes: fileLimit}, nil
+	uploadBaseURL := strings.TrimRight(firstEnvDefault("SKILL2API_UPLOAD_BASE_URL", "https://huabot.com"), "/")
+	uploadURL, err := url.ParseRequestURI(uploadBaseURL)
+	if err != nil || uploadURL.Scheme == "" || uploadURL.Host == "" {
+		return config{}, errors.New("SKILL2API_UPLOAD_BASE_URL must be an absolute URL")
+	}
+	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexDockerOptDir: optDir, CodexNoProxy: noProxy, UploadBaseURL: uploadBaseURL, Timeout: timeout, MaxOutput: limit, MaxFileBytes: fileLimit}, nil
 }
 func firstEnvDefault(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -1201,6 +1211,80 @@ func readTaskFile(outputDir, rawPath string, maxBytes int) ([]byte, error) {
 	return data, nil
 }
 
+type temporaryUploadResponse struct {
+	File json.RawMessage `json:"file"`
+	Err  string          `json:"err"`
+}
+
+type uploadedFile struct {
+	FileKey string `json:"file_key"`
+	FileExt string `json:"file_ext"`
+}
+
+func uploadTemporaryFile(ctx context.Context, c config, req fileRequest, data []byte) (json.RawMessage, string, error) {
+	if err := validateEnvironment(req.Environment); err != nil {
+		return nil, "", err
+	}
+	apiKey := strings.TrimSpace(req.Environment["SANDBOX_AI_KEY"])
+	if apiKey == "" {
+		return nil, "", errors.New("SANDBOX_AI_KEY is required for file upload")
+	}
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", filepath.Base(req.FilePath))
+	if err != nil {
+		return nil, "", fmt.Errorf("create upload file part: %w", err)
+	}
+	if _, err := part.Write(data); err != nil {
+		return nil, "", fmt.Errorf("write upload file part: %w", err)
+	}
+	if err := writer.WriteField("temporary", "true"); err != nil {
+		return nil, "", fmt.Errorf("write temporary field: %w", err)
+	}
+	if err := writer.WriteField("skill2api", "true"); err != nil {
+		return nil, "", fmt.Errorf("write skill2api field: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return nil, "", fmt.Errorf("close upload body: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.UploadBaseURL+"/api/file/run/", &body)
+	if err != nil {
+		return nil, "", fmt.Errorf("create upload request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+apiKey)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return nil, "", fmt.Errorf("upload temporary file: %w", err)
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, int64(maxOutput)+1))
+	if err != nil {
+		return nil, "", fmt.Errorf("read upload response: %w", err)
+	}
+	if len(responseBody) > maxOutput {
+		return nil, "", errors.New("upload response exceeds maximum size")
+	}
+	var payload temporaryUploadResponse
+	if err := json.Unmarshal(responseBody, &payload); err != nil {
+		return nil, "", fmt.Errorf("decode upload response: %w", err)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		if payload.Err != "" {
+			return nil, "", fmt.Errorf("upload temporary file: %s", payload.Err)
+		}
+		return nil, "", fmt.Errorf("upload temporary file returned HTTP %d", response.StatusCode)
+	}
+	var uploaded uploadedFile
+	if len(payload.File) == 0 || json.Unmarshal(payload.File, &uploaded) != nil || len(uploaded.FileKey) < 4 || strings.TrimSpace(uploaded.FileExt) == "" {
+		return nil, "", errors.New("upload response did not contain a valid file")
+	}
+	fileKey := url.PathEscape(uploaded.FileKey)
+	fileExt := url.PathEscape(strings.TrimPrefix(uploaded.FileExt, "."))
+	path := fmt.Sprintf("/upload/%s/%s/%s.%s", fileKey[:2], fileKey[2:4], fileKey, fileExt)
+	return payload.File, path, nil
+}
+
 func execute(store *statusStore, manager *taskManager, c config, req generateRequest) {
 	v, err := store.claimQueued(req.RequestID)
 	if err != nil {
@@ -1460,8 +1544,14 @@ func handleFile(job periodic.Job, store *statusStore, c config) {
 		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "failed", "error": err.Error()})
 		return
 	}
-	log.Printf("event=skill2api_file request_id=%s result=returned bytes=%d", req.RequestID, len(data))
-	_ = job.Done(data)
+	file, uploadURL, err := uploadTemporaryFile(context.Background(), c, req, data)
+	if err != nil {
+		log.Printf("event=skill2api_file request_id=%s result=upload_failed error=%q", req.RequestID, err)
+		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "failed", "error": err.Error()})
+		return
+	}
+	log.Printf("event=skill2api_file request_id=%s result=uploaded bytes=%d", req.RequestID, len(data))
+	doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "succeeded", "file": file, "url": uploadURL})
 }
 
 func handleResume(job periodic.Job, store *statusStore, manager *taskManager, c config) {

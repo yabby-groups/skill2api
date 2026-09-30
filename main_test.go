@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,6 +70,45 @@ func TestReadTaskFileRejectsUnsafeAndOversizedPaths(t *testing.T) {
 	}
 	if _, err := readTaskFile(root, "outside", 1024); err == nil {
 		t.Fatal("symlink outside the output directory was accepted")
+	}
+}
+
+func TestUploadTemporaryFileUsesTokenCredentialAndReturnsRelativeURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/file/run/" || r.Method != http.MethodPost {
+			t.Fatalf("unexpected upload request: %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer private-key" {
+			t.Fatalf("unexpected authorization header: %q", r.Header.Get("Authorization"))
+		}
+		if err := r.ParseMultipartForm(1024); err != nil {
+			t.Fatal(err)
+		}
+		if r.FormValue("temporary") != "true" || r.FormValue("skill2api") != "true" {
+			t.Fatalf("unexpected upload fields: %#v", r.MultipartForm.Value)
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		data, err := io.ReadAll(file)
+		if err != nil || header.Filename != "result.mp4" || !bytes.Equal(data, []byte("video")) {
+			t.Fatalf("unexpected upload file: name=%q data=%q err=%v", header.Filename, data, err)
+		}
+		_, _ = w.Write([]byte(`{"file":{"file_key":"abcdef","file_ext":"mp4"}}`))
+	}))
+	defer server.Close()
+
+	file, uploadURL, err := uploadTemporaryFile(context.Background(), config{UploadBaseURL: server.URL}, fileRequest{
+		FilePath:    "outputs/result.mp4",
+		Environment: map[string]string{"SANDBOX_AI_KEY": "private-key"},
+	}, []byte("video"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(file) != `{"file_key":"abcdef","file_ext":"mp4"}` || uploadURL != "/upload/ab/cd/abcdef.mp4" {
+		t.Fatalf("unexpected upload result: file=%s url=%q", file, uploadURL)
 	}
 }
 
