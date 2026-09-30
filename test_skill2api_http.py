@@ -502,17 +502,37 @@ def submit_generation(base_url: str, token: str, prompt: str, model: str) -> str
     return request_id
 
 
-def download_results(
-    base_url: str,
-    token: str,
-    request_id: str,
-    status: dict[str, Any],
-    output: Path,
-) -> None:
-    """Download the last-created MP4 reported by the successful status response."""
-    output.mkdir(parents=True, exist_ok=True)
+def final_mp4_from_status(status: dict[str, Any]) -> str | None:
+    """Return the final task MP4 linked from status logs, with a files fallback.
+
+    Codex can write its terminal response to either stderr or stdout. A link is
+    accepted only when it names an MP4 listed in the worker's task-local files.
+    """
     files = status.get("files") or []
-    final_mp4 = next(
+    available = {path for path in files if isinstance(path, str)}
+
+    for stream_name in ("stderr", "stdout"):
+        stream = status.get(stream_name)
+        if not isinstance(stream, str):
+            continue
+        matches = list(MARKDOWN_LINK_RE.finditer(stream))
+        for match in reversed(matches):
+            target = urllib.parse.unquote(match.group(1).strip())
+            parsed = urllib.parse.urlsplit(target)
+            if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+                continue
+            path = parsed.path
+            if path.startswith("/workspace/"):
+                path = path.removeprefix("/workspace/")
+            elif path.startswith("/"):
+                continue
+            path = posixpath.normpath(path)
+            if path in {".", ".."} or path.startswith("../"):
+                continue
+            if path.lower().endswith(".mp4") and path in available:
+                return path
+
+    return next(
         (
             relative_path
             for relative_path in reversed(files)
@@ -520,6 +540,18 @@ def download_results(
         ),
         None,
     )
+
+
+def download_results(
+    base_url: str,
+    token: str,
+    request_id: str,
+    status: dict[str, Any],
+    output: Path,
+) -> None:
+    """Download the final MP4 reported by the successful status response."""
+    output.mkdir(parents=True, exist_ok=True)
+    final_mp4 = final_mp4_from_status(status)
     if final_mp4 is None:
         raise RuntimeError("Skill2API succeeded but status reported no MP4 result")
 
