@@ -54,7 +54,7 @@ job name. The normal states are:
 | `running` | Codex is executing the skill. |
 | `interrupted` | Worker restarted after saving the Codex session; it can be resumed. |
 | `waiting_for_input` | The skill asked a question and is waiting for an answer. |
-| `succeeded` | The task completed; `files` lists the generated files. |
+| `succeeded` | The task completed; `files` lists files by modification time, oldest first. |
 | `failed` | Execution failed; inspect `error`, `stdout`, and `stderr`. |
 | `terminated` | The task was stopped by an explicit terminate request. |
 | `not_found` | No job exists for the requested ID. |
@@ -70,7 +70,8 @@ output is omitted, the field starts with `[earlier output truncated]`.
 Codex writes complete output directly to
 `SKILL2API_OUTPUT_ROOT/<request_id>/stdout.log` and `stderr.log`. These files
 are updated while Codex runs. The worker does not rewrite `status.json` for
-output changes: log tails are read only when `skill2api_status` is called.
+output changes: `skill2api_status` reads log tails and rebuilds `files` from
+the current output directory without persisting either update.
 Caller-provided prompts and resume answers are redacted before either log is
 written. Codex session IDs are also redacted from public logs and status
 responses; the worker retains the ID privately for resume.

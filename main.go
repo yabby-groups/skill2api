@@ -1174,7 +1174,11 @@ func readOutputTailSince(path string, offset int64, limit int) (string, error) {
 }
 
 func listFiles(dir string) ([]string, error) {
-	var files []string
+	type fileEntry struct {
+		path    string
+		modTime time.Time
+	}
+	var entries []fileEntry
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -1184,11 +1188,23 @@ func listFiles(dir string) ([]string, error) {
 			if e != nil {
 				return e
 			}
-			files = append(files, filepath.ToSlash(rel))
+			entries = append(entries, fileEntry{
+				path:    filepath.ToSlash(rel),
+				modTime: info.ModTime(),
+			})
 		}
 		return nil
 	})
-	sort.Strings(files)
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].modTime.Equal(entries[j].modTime) {
+			return entries[i].path < entries[j].path
+		}
+		return entries[i].modTime.Before(entries[j].modTime)
+	})
+	files := make([]string, len(entries))
+	for i, entry := range entries {
+		files[i] = entry.path
+	}
 	return files, err
 }
 
@@ -1531,6 +1547,11 @@ func handleStatus(job periodic.Job, store *statusStore, c config) {
 		log.Printf("event=skill2api_status request_id=%s result=corrupt error=%q", req.RequestID, err)
 		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "failed", "error": err.Error()})
 		return
+	}
+	if files, listErr := listFiles(v.OutputDir); listErr != nil {
+		log.Printf("event=skill2api_status request_id=%s result=file_list_failed error=%q", req.RequestID, listErr)
+	} else {
+		v.Files = files
 	}
 	response, outputErr := statusWithLogOutput(v, c.MaxOutput)
 	if outputErr != nil {

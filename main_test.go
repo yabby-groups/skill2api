@@ -73,6 +73,37 @@ func TestReadTaskFileRejectsUnsafeAndOversizedPaths(t *testing.T) {
 	}
 }
 
+func TestListFilesOrdersByModificationTime(t *testing.T) {
+	root := t.TempDir()
+	oldFile := filepath.Join(root, "assets", "source.mp4")
+	newFile := filepath.Join(root, "deliverable", "final.mp4")
+	for _, path := range []string{oldFile, newFile} {
+		if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("video"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldTime := time.Date(2026, time.September, 30, 8, 0, 0, 0, time.UTC)
+	newTime := oldTime.Add(time.Minute)
+	if err := os.Chtimes(oldFile, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(newFile, newTime, newTime); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := listFiles(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"assets/source.mp4", "deliverable/final.mp4"}
+	if !reflect.DeepEqual(files, want) {
+		t.Fatalf("listFiles() = %#v, want %#v", files, want)
+	}
+}
+
 func TestUploadTemporaryFileUsesTokenCredentialAndReturnsRelativeURL(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/file/run/" || r.Method != http.MethodPost {
