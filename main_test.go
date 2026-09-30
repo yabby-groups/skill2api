@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -187,12 +190,24 @@ func TestWithoutProxyEnvRemovesProxyVariablesOnly(t *testing.T) {
 
 func TestCodexExecArgsSelectsSandboxAndNetworkMode(t *testing.T) {
 	want := []string{"exec", "-c", "sandbox_workspace_write.network_access=true", "--model", "gpt-6-sol", "--sandbox", "workspace-write", "--cd", "/tmp/request-1", "--skip-git-repo-check", "prompt"}
-	if got := codexExecArgs(config{CodexNetworkAccess: true}, "gpt-6-sol", "/tmp/request-1", []string{"prompt"}); !reflect.DeepEqual(got, want) {
+	if got := codexExecArgs(config{}, "gpt-6-sol", "/tmp/request-1", []string{"prompt"}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("native args = %#v, want %#v", got, want)
 	}
 	want = []string{"exec", "--model", "gpt-6-sol", "--sandbox", "danger-full-access", "--cd", "/workspace", "--skip-git-repo-check", "prompt"}
-	if got := codexExecArgs(config{CodexDocker: true, CodexNetworkAccess: true}, "gpt-6-sol", "/tmp/request-1", []string{"prompt"}); !reflect.DeepEqual(got, want) {
+	if got := codexExecArgs(config{CodexDocker: true}, "gpt-6-sol", "/tmp/request-1", []string{"prompt"}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("docker args = %#v, want %#v", got, want)
+	}
+}
+
+func TestCommandExitCode(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "exit 127")
+	if err := cmd.Run(); err == nil {
+		t.Fatal("command unexpectedly succeeded")
+	} else if got := commandExitCode(err); got != 127 {
+		t.Fatalf("exit code = %d, want 127", got)
+	}
+	if got := commandExitCode(errors.New("start failed")); got != -1 {
+		t.Fatalf("non-exit error code = %d, want -1", got)
 	}
 }
 
@@ -219,33 +234,49 @@ func TestDockerCodexCommandIsolatedAndReceivesExplicitEnvironment(t *testing.T) 
 		t.Fatalf("unexpected executable: %q (%q)", executable, cmd.Path)
 	}
 	joined := strings.Join(cmd.Args, "\n")
-	for _, want := range []string{"run", "--rm", "--init", "--network\nnone", "dst=/workspace", "dst=/home/ubuntu", "--workdir\n/workspace", "--env\nSANDBOX_AI_KEY", "--env\nOTHER_TOKEN", "example/sandbox:tag", "--sandbox\ndanger-full-access", "--cd\n/workspace"} {
+	for _, want := range []string{"run", "--init", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), "dst=/workspace", "dst=/home/ubuntu", "--workdir\n/workspace", "--env\nHOME=/home/ubuntu", "--env\nSANDBOX_AI_KEY", "--env\nOTHER_TOKEN", "example/sandbox:tag\ncodex\nexec", "--sandbox\ndanger-full-access", "--cd\n/workspace"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("docker command missing %q: %q", want, joined)
 		}
 	}
+	if strings.Contains(joined, "dst=/home/ubuntu/.codex/sessions") {
+		t.Fatalf("Docker command must mount the private home, not only sessions: %q", cmd.Args)
+	}
 	if strings.Contains(joined, "dst=/opt") {
 		t.Fatalf("Docker command mounted /opt without configuration: %q", cmd.Args)
+	}
+	if strings.Contains(joined, "--network\nnone") {
+		t.Fatalf("Docker command blocked provider network access: %q", cmd.Args)
 	}
 	if strings.Contains(joined, "client-key") || strings.Contains(joined, "other-value") {
 		t.Fatalf("docker command exposed environment values: %q", joined)
 	}
 	if !strings.Contains(joined, codexHomeDir(c, "request-1")) {
-		t.Fatalf("docker command did not mount the persistent home: %q", joined)
+		t.Fatalf("docker command did not mount persistent home: %q", joined)
 	}
 	if _, err := os.Stat(codexHomeDir(c, "request-1")); err != nil {
 		t.Fatalf("persistent home was not created: %v", err)
 	}
+	configPath := filepath.Join(codexHomeDir(c, "request-1"), ".codex", "config.toml")
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read Docker Codex config: %v", err)
+	}
+	if string(configData) != dockerCodexConfig {
+		t.Fatalf("Docker Codex config = %q, want %q", configData, dockerCodexConfig)
+	}
+	configInfo, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("stat Docker Codex config: %v", err)
+	}
+	if configInfo.Mode().Perm() != 0600 {
+		t.Fatalf("Docker Codex config permissions = %o, want 600", configInfo.Mode().Perm())
+	}
+	if strings.Contains(string(configData), "client-key") || strings.Contains(string(configData), "other-value") {
+		t.Fatalf("Docker Codex config persisted request environment: %q", configData)
+	}
 	if !strings.Contains(strings.Join(cmd.Env, "\n"), "SANDBOX_AI_KEY=client-key") {
 		t.Fatalf("client key was not forwarded to Docker: %#v", cmd.Env)
-	}
-	c.CodexNetworkAccess = true
-	cmd, _, err = newCodexCommand(context.Background(), c, "request-1", outputDir, nil, codexExecArgs(c, "", outputDir, []string{"prompt"}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(strings.Join(cmd.Args, "\n"), "--network\nnone") {
-		t.Fatalf("network-enabled Docker command remained isolated: %#v", cmd.Args)
 	}
 }
 
@@ -305,7 +336,18 @@ func TestDockerCodexHomesAreIsolatedPerRequest(t *testing.T) {
 	}
 	firstHome, secondHome := codexHomeDir(c, "request-1"), codexHomeDir(c, "request-2")
 	if firstHome == secondHome || !strings.Contains(strings.Join(first.Args, "\n"), firstHome) || !strings.Contains(strings.Join(second.Args, "\n"), secondHome) {
-		t.Fatalf("Docker requests shared a Codex home: first=%q second=%q", first.Args, second.Args)
+		t.Fatalf("Docker requests shared Codex home: first=%q second=%q", first.Args, second.Args)
+	}
+	firstConfig := filepath.Join(firstHome, ".codex", "config.toml")
+	secondConfig := filepath.Join(secondHome, ".codex", "config.toml")
+	if firstConfig == secondConfig {
+		t.Fatalf("Docker requests shared Codex config path: first=%q second=%q", firstConfig, secondConfig)
+	}
+	if _, err := os.Stat(firstConfig); err != nil {
+		t.Fatalf("first Docker config was not created: %v", err)
+	}
+	if _, err := os.Stat(secondConfig); err != nil {
+		t.Fatalf("second Docker config was not created: %v", err)
 	}
 }
 
@@ -802,7 +844,7 @@ func TestConfigPlainModeUsesPeriodicSettings(t *testing.T) {
 	if c.Timeout != 6*time.Hour {
 		t.Fatalf("default Codex timeout = %s, want %s", c.Timeout, 6*time.Hour)
 	}
-	if c.CodexNoProxy || c.CodexNetworkAccess || c.CodexDocker || c.CodexDockerBin != "docker" || c.CodexDockerImage != "lupino/sandbox-runner:latest" {
+	if c.CodexNoProxy || c.CodexDocker || c.CodexDockerBin != "docker" || c.CodexDockerImage != "lupino/sandbox-runner:latest" {
 		t.Fatalf("direct provider settings should default to false: %#v", c)
 	}
 	if withPrefix(c.TaskPrefix, generateFunc) != "generation-skill2api_generate" || statusFunc != "skill2api_status" || cleanupFunc != "skill2api_cleanup" {
@@ -821,25 +863,6 @@ func TestConfigCodexTimeoutOverride(t *testing.T) {
 	}
 	if c.Timeout != 8*time.Hour {
 		t.Fatalf("Codex timeout override = %s, want %s", c.Timeout, 8*time.Hour)
-	}
-}
-
-func TestConfigCodexNetworkAccess(t *testing.T) {
-	t.Setenv("PERIODIC_PORT", "tcp://periodic:5000")
-	t.Setenv("PERIODIC_RSA_MODE", "0")
-	t.Setenv("SKILL2API_OUTPUT_ROOT", t.TempDir())
-	t.Setenv("SKILL2API_CODEX_NETWORK_ACCESS", "true")
-	c, err := newConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !c.CodexNetworkAccess {
-		t.Fatal("network access was not enabled")
-	}
-
-	t.Setenv("SKILL2API_CODEX_NETWORK_ACCESS", "invalid")
-	if _, err := newConfig(); err == nil || !strings.Contains(err.Error(), "SKILL2API_CODEX_NETWORK_ACCESS") {
-		t.Fatalf("invalid network-access setting error = %v", err)
 	}
 }
 

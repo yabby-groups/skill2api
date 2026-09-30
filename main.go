@@ -22,18 +22,32 @@ import (
 )
 
 const (
-	generateFunc  = "skill2api_generate"
-	statusFunc    = "skill2api_status"
-	fileFunc      = "skill2api_file"
-	resumeFunc    = "skill2api_resume"
-	terminateFunc = "skill2api_terminate"
-	cleanupFunc   = "skill2api_cleanup"
-	maxOutput     = 64 * 1024
-	maxFileBytes  = 64 * 1024 * 1024
-	maxSkillName  = 128
-	retentionAge  = 24 * time.Hour
-	stdoutLogName = "stdout.log"
-	stderrLogName = "stderr.log"
+	generateFunc      = "skill2api_generate"
+	statusFunc        = "skill2api_status"
+	fileFunc          = "skill2api_file"
+	resumeFunc        = "skill2api_resume"
+	terminateFunc     = "skill2api_terminate"
+	cleanupFunc       = "skill2api_cleanup"
+	maxOutput         = 64 * 1024
+	maxFileBytes      = 64 * 1024 * 1024
+	maxSkillName      = 128
+	retentionAge      = 24 * time.Hour
+	stdoutLogName     = "stdout.log"
+	stderrLogName     = "stderr.log"
+	dockerCodexConfig = `sandbox_mode = "danger-full-access"
+model_provider = "sandbox_runner"
+model = "gpt-5.6-luna"
+
+[model_providers.sandbox_runner]
+name = "Sandbox Runner"
+base_url = "https://huabot.com/v1"
+wire_api = "responses"
+env_key = "SANDBOX_AI_KEY"
+supports_websockets = false
+
+[projects."/workspace"]
+trust_level = "trusted"
+`
 )
 
 type generateRequest struct {
@@ -136,21 +150,20 @@ func statusWithLogOutput(v taskStatus, limit int) (statusResponse, error) {
 }
 
 type config struct {
-	PeriodicAddr       string
-	TaskPrefix         string
-	RSA                protocol.RSAConnParam
-	OutputRoot         string
-	SkillsDir          string
-	CodexBin           string
-	CodexDocker        bool
-	CodexDockerBin     string
-	CodexDockerImage   string
-	CodexDockerOptDir  string
-	CodexNoProxy       bool
-	CodexNetworkAccess bool
-	Timeout            time.Duration
-	MaxOutput          int
-	MaxFileBytes       int
+	PeriodicAddr      string
+	TaskPrefix        string
+	RSA               protocol.RSAConnParam
+	OutputRoot        string
+	SkillsDir         string
+	CodexBin          string
+	CodexDocker       bool
+	CodexDockerBin    string
+	CodexDockerImage  string
+	CodexDockerOptDir string
+	CodexNoProxy      bool
+	Timeout           time.Duration
+	MaxOutput         int
+	MaxFileBytes      int
 }
 
 type statusStore struct {
@@ -227,10 +240,6 @@ func newConfig() (config, error) {
 	if err != nil {
 		return config{}, errors.New("SKILL2API_CODEX_NO_PROXY must be true or false")
 	}
-	networkAccess, err := strconv.ParseBool(firstEnvDefault("SKILL2API_CODEX_NETWORK_ACCESS", "false"))
-	if err != nil {
-		return config{}, errors.New("SKILL2API_CODEX_NETWORK_ACCESS must be true or false")
-	}
 	dockerEnabled, err := strconv.ParseBool(firstEnvDefault("SKILL2API_CODEX_DOCKER", "false"))
 	if err != nil {
 		return config{}, errors.New("SKILL2API_CODEX_DOCKER must be true or false")
@@ -249,7 +258,7 @@ func newConfig() (config, error) {
 			return config{}, errors.New("SKILL2API_CODEX_DOCKER_OPT_DIR must be an existing directory")
 		}
 	}
-	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexDockerOptDir: optDir, CodexNoProxy: noProxy, CodexNetworkAccess: networkAccess, Timeout: timeout, MaxOutput: limit, MaxFileBytes: fileLimit}, nil
+	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexDockerOptDir: optDir, CodexNoProxy: noProxy, Timeout: timeout, MaxOutput: limit, MaxFileBytes: fileLimit}, nil
 }
 func firstEnvDefault(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -772,11 +781,19 @@ func runCodexCommand(ctx context.Context, c config, requestID, outputDir string,
 		return stdout, stderr, stderrWriter.sessionID, fmt.Errorf("codex timed out")
 	}
 	if err != nil {
-		log.Printf("event=skill2api_codex_finish result=failed error=%q stdout_bytes=%d stderr_bytes=%d", err, len(stdout), len(stderr))
+		log.Printf("event=skill2api_codex_finish result=failed error=%q exit_code=%d stdout_bytes=%d stderr_bytes=%d", err, commandExitCode(err), len(stdout), len(stderr))
 		return stdout, stderr, stderrWriter.sessionID, fmt.Errorf("codex exited: %w", err)
 	}
 	log.Printf("event=skill2api_codex_finish result=succeeded stdout_bytes=%d stderr_bytes=%d", len(stdout), len(stderr))
 	return stdout, stderr, stderrWriter.sessionID, nil
+}
+
+func commandExitCode(err error) int {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return -1
 }
 
 func codexRequestEnvironment(c config, values map[string]string) map[string]string {
@@ -802,7 +819,7 @@ func codexExecArgs(c config, model, outputDir string, tail []string) []string {
 		sandbox = "danger-full-access"
 	}
 	args := []string{"exec"}
-	if c.CodexNetworkAccess && !c.CodexDocker {
+	if !c.CodexDocker {
 		args = append(args, "-c", "sandbox_workspace_write.network_access=true")
 	}
 	if model != "" {
@@ -814,6 +831,21 @@ func codexExecArgs(c config, model, outputDir string, tail []string) []string {
 
 func codexHomeDir(c config, requestID string) string {
 	return filepath.Join(c.OutputRoot, ".skill2api-codex", requestID, "home")
+}
+
+func prepareDockerCodexHome(home string) error {
+	configDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		return fmt.Errorf("create Codex config directory: %w", err)
+	}
+	configPath := filepath.Join(configDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(dockerCodexConfig), 0600); err != nil {
+		return fmt.Errorf("write Codex config: %w", err)
+	}
+	if err := os.Chmod(configPath, 0600); err != nil {
+		return fmt.Errorf("protect Codex config: %w", err)
+	}
+	return nil
 }
 
 func dockerEnvironment(c config, environment map[string]string) map[string]string {
@@ -828,11 +860,11 @@ func dockerEnvironment(c config, environment map[string]string) map[string]strin
 }
 
 func newCodexCommand(ctx context.Context, c config, requestID, outputDir string, environment map[string]string, args []string) (*exec.Cmd, string, error) {
-	home := codexHomeDir(c, requestID)
-	if err := os.MkdirAll(home, 0700); err != nil {
-		return nil, c.CodexBin, fmt.Errorf("create Codex home: %w", err)
-	}
 	if !c.CodexDocker {
+		home := codexHomeDir(c, requestID)
+		if err := os.MkdirAll(home, 0700); err != nil {
+			return nil, c.CodexBin, fmt.Errorf("create Codex home: %w", err)
+		}
 		cmd := exec.CommandContext(ctx, c.CodexBin, args...)
 		nativeEnvironment := make(map[string]string, len(environment)+1)
 		for key, value := range environment {
@@ -842,10 +874,14 @@ func newCodexCommand(ctx context.Context, c config, requestID, outputDir string,
 		cmd.Env = codexEnvironment(os.Environ(), nativeEnvironment, c.CodexNoProxy)
 		return cmd, c.CodexBin, nil
 	}
-	dockerArgs := []string{"run", "--rm", "--init", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())}
-	if !c.CodexNetworkAccess {
-		dockerArgs = append(dockerArgs, "--network", "none")
+	home := codexHomeDir(c, requestID)
+	if err := os.MkdirAll(home, 0700); err != nil {
+		return nil, c.CodexDockerBin, fmt.Errorf("create Codex home: %w", err)
 	}
+	if err := prepareDockerCodexHome(home); err != nil {
+		return nil, c.CodexDockerBin, err
+	}
+	dockerArgs := []string{"run", "--init", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())}
 	dockerArgs = append(dockerArgs,
 		"--mount", "type=bind,src="+outputDir+",dst=/workspace",
 		"--mount", "type=bind,src="+home+",dst=/home/ubuntu",
@@ -865,10 +901,21 @@ func newCodexCommand(ctx context.Context, c config, requestID, outputDir string,
 		dockerArgs = append(dockerArgs, "--env", key)
 	}
 	dockerArgs = append(dockerArgs, c.CodexDockerImage)
+	// The sandbox image entrypoint executes its arguments directly, so Docker
+	// runs must include the executable that native exec.Command supplies.
+	dockerArgs = append(dockerArgs, c.CodexBin)
 	dockerArgs = append(dockerArgs, args...)
+	log.Printf("event=skill2api_codex_command mode=docker docker_bin=%s image=%s network_access=true opt_dir_mounted=%t output_dir=%s container_workdir=/workspace container_home=/home/ubuntu codex_subcommand=%s", c.CodexDockerBin, c.CodexDockerImage, c.CodexDockerOptDir != "", outputDir, codexSubcommand(args))
 	cmd := exec.CommandContext(ctx, c.CodexDockerBin, dockerArgs...)
 	cmd.Env = codexEnvironment(os.Environ(), dockerEnv, c.CodexNoProxy)
 	return cmd, c.CodexDockerBin, nil
+}
+
+func codexSubcommand(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	return args[0]
 }
 
 func withoutProxyEnv(environ []string) []string {
@@ -1561,26 +1608,33 @@ func handleCleanup(job periodic.Job, store *statusStore, c config) {
 	doneJSON(job, result)
 }
 
-func registerWorkerFuncs(worker *periodic.Worker, prefix string, store *statusStore, manager *taskManager, c config) error {
-	if err := worker.AddFunc(withPrefix(prefix, generateFunc), func(job periodic.Job) { handleGenerate(job, store, manager, c) }); err != nil {
+func addWorkerFunc(worker *periodic.Worker, prefix, name string, handler func(periodic.Job)) error {
+	function := withPrefix(prefix, name)
+	if err := worker.AddFunc(function, handler); err != nil {
+		log.Printf("event=skill2api_register function=%s result=failed error=%q", function, err)
 		return err
 	}
-	if err := worker.AddFunc(withPrefix(prefix, statusFunc), func(job periodic.Job) { handleStatus(job, store, c) }); err != nil {
-		return err
-	}
-	if err := worker.AddFunc(withPrefix(prefix, fileFunc), func(job periodic.Job) { handleFile(job, store, c) }); err != nil {
-		return err
-	}
-	if err := worker.AddFunc(withPrefix(prefix, resumeFunc), func(job periodic.Job) { handleResume(job, store, manager, c) }); err != nil {
-		return err
-	}
-	if err := worker.AddFunc(withPrefix(prefix, terminateFunc), func(job periodic.Job) { handleTerminate(job, store, manager) }); err != nil {
-		return err
-	}
-	if err := worker.AddFunc(withPrefix(prefix, cleanupFunc), func(job periodic.Job) { handleCleanup(job, store, c) }); err != nil {
-		return err
-	}
+	log.Printf("event=skill2api_register function=%s result=registered", function)
 	return nil
+}
+
+func registerWorkerFuncs(worker *periodic.Worker, prefix string, store *statusStore, manager *taskManager, c config) error {
+	if err := addWorkerFunc(worker, prefix, generateFunc, func(job periodic.Job) { handleGenerate(job, store, manager, c) }); err != nil {
+		return err
+	}
+	if err := addWorkerFunc(worker, prefix, statusFunc, func(job periodic.Job) { handleStatus(job, store, c) }); err != nil {
+		return err
+	}
+	if err := addWorkerFunc(worker, prefix, fileFunc, func(job periodic.Job) { handleFile(job, store, c) }); err != nil {
+		return err
+	}
+	if err := addWorkerFunc(worker, prefix, resumeFunc, func(job periodic.Job) { handleResume(job, store, manager, c) }); err != nil {
+		return err
+	}
+	if err := addWorkerFunc(worker, prefix, terminateFunc, func(job periodic.Job) { handleTerminate(job, store, manager) }); err != nil {
+		return err
+	}
+	return addWorkerFunc(worker, prefix, cleanupFunc, func(job periodic.Job) { handleCleanup(job, store, c) })
 }
 func connectPeriodic(client *periodic.Client, addr string, rsa protocol.RSAConnParam) error {
 	return client.Connect(addr, rsa)
@@ -1591,6 +1645,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	log.Printf("event=skill2api_starting output_root=%s skills_dir=%s task_prefix=%s timeout_seconds=%d", c.OutputRoot, c.SkillsDir, c.TaskPrefix, int(c.Timeout.Seconds()))
 	store := &statusStore{root: c.OutputRoot}
 	manager := newTaskManager()
 	if err := os.MkdirAll(c.OutputRoot, 0750); err != nil {
@@ -1599,20 +1654,27 @@ func main() {
 	if err := store.recoverRunning(); err != nil {
 		panic(err)
 	}
+	log.Printf("event=skill2api_startup result=recovered_running_requests")
 	for {
 		worker := periodic.NewWorker(8)
 		worker.SetIOTimeout(30*time.Second, 10*time.Second)
+		log.Printf("event=skill2api_connect result=starting")
 		if err := connectPeriodic(&worker.Client, c.PeriodicAddr, c.RSA); err != nil {
+			log.Printf("event=skill2api_connect result=failed error=%q", err)
 			worker.Close()
 			time.Sleep(time.Second)
 			continue
 		}
+		log.Printf("event=skill2api_connect result=connected")
 		if err := registerWorkerFuncs(worker, c.TaskPrefix, store, manager, c); err != nil {
+			log.Printf("event=skill2api_startup result=registration_failed error=%q", err)
 			worker.Close()
 			time.Sleep(time.Second)
 			continue
 		}
+		log.Printf("event=skill2api_worker result=started")
 		worker.Work()
+		log.Printf("event=skill2api_worker result=stopped")
 		worker.Close()
 		time.Sleep(time.Second)
 	}

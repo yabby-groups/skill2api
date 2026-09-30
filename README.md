@@ -121,11 +121,34 @@ instead of invoking the worker host's `codex` binary. The default image is
 CLI binary and defaults to `docker`.
 
 The worker mounts the task output directory at `/workspace` and a private,
-per-request Codex home at `/home/ubuntu`. The private home retains the Codex
-session across `skill2api_resume` calls and is not included in the task's
-`files` response. Codex runs in the container with
+per-request Codex home at `/home/ubuntu`. Docker runs as the host UID/GID so
+Codex can write that bind mount. The home persists across `skill2api_resume`
+calls and is not included in the task's `files` response. The image startup
+script executes `codex exec ...`; Codex runs in the container with
 `--sandbox danger-full-access`; do not mount the Docker socket into this
-runner.
+runner. Before every Docker invocation, the worker writes the following
+provider configuration to the task's private
+`/home/ubuntu/.codex/config.toml`:
+
+```toml
+sandbox_mode = "danger-full-access"
+model_provider = "sandbox_runner"
+model = "gpt-5.6-luna"
+
+[model_providers.sandbox_runner]
+name = "Sandbox Runner"
+base_url = "https://huabot.com/v1"
+wire_api = "responses"
+env_key = "SANDBOX_AI_KEY"
+supports_websockets = false
+
+[projects."/workspace"]
+trust_level = "trusted"
+```
+
+Docker runs use the Docker default network so this provider is reachable. A
+request `model` remains an explicit Codex command-line override of this
+configuration default.
 
 Optionally set `SKILL2API_CODEX_DOCKER_OPT_DIR` to an existing host directory
 of externally managed tools. When Docker mode is enabled, the worker mounts it
@@ -152,10 +175,9 @@ Set `SKILL2API_CODEX_NO_PROXY=true` when Codex skills must reach providers
 directly. The worker then removes `http_proxy`, `https_proxy`, `all_proxy`, and
 `no_proxy` from the Codex subprocess environment. The default is `false`.
 
-Set `SKILL2API_CODEX_NETWORK_ACCESS=true` to allow direct outbound network
-connections. Native Codex runs receive the corresponding `workspace-write`
-sandbox setting. Docker Codex runs omit their default `--network none` and use
-the Docker default network. The default is `false`.
+Native Codex runs always receive the `workspace-write` network-access setting.
+Docker Codex runs always use the Docker default network for the configured
+Sandbox Runner provider. Outbound network access is not configurable.
 
 ## Terminate a Job
 
