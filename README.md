@@ -126,7 +126,12 @@ Codex can write that bind mount. The home persists across `skill2api_resume`
 calls and is not included in the task's `files` response. The image startup
 script executes `codex exec ...`; Codex runs in the container with
 `--sandbox danger-full-access`; do not mount the Docker socket into this
-runner. Before every Docker invocation, the worker writes the following
+runner. Each container is named `skill2api-<request_id>` and uses Docker's
+`--rm` cleanup. `skill2api_terminate` force-removes that named container after
+cancelling the worker process. The prefix keeps Docker names valid when a
+request ID starts with `.`, `_`, or `-`.
+
+Before every Docker invocation, the worker writes the following
 provider configuration to the task's private
 `/home/ubuntu/.codex/config.toml`:
 
@@ -274,6 +279,18 @@ Resume returns immediately with `running`; continue polling:
 A job can enter `waiting_for_input` more than once. Use the same
 `skill2api_resume` function for each question. The internal Codex session ID is
 persisted but is never returned by the status function.
+
+Skills must use this exact two-line marker when a zero-exit execution still
+requires caller action before the requested deliverable can be produced:
+
+```text
+SKILL2API_INPUT_REQUIRED
+{"question":"Provide the missing source video","options":["submit source video"]}
+```
+
+This returns `waiting_for_input`; ordinary natural-language statements about a
+missing credential, source, approval, or decision do not change a successful
+Codex process exit into a non-terminal task state.
 
 ## Skill Authoring Guidance
 

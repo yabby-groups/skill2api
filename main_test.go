@@ -208,6 +208,89 @@ func TestParseInputRequest(t *testing.T) {
 	if _, needed, err := parseInputRequest("no interaction"); err != nil || needed {
 		t.Fatalf("ordinary output was treated as input request: needed=%t err=%v", needed, err)
 	}
+	if _, needed, err := parseInputRequest("SKILL2API_INPUT_REQUIRED\nnot JSON\n"); !needed || err == nil {
+		t.Fatalf("malformed input request was accepted: needed=%t err=%v", needed, err)
+	}
+	if _, needed, err := parseInputRequest("SKILL2API_INPUT_REQUIRED\n{\"question\":\"old\"}\nmore output"); needed || err != nil {
+		t.Fatalf("non-terminal input request was accepted: needed=%t err=%v", needed, err)
+	}
+}
+
+func TestDockerExecutionMarksInputRequiredInsteadOfSucceeded(t *testing.T) {
+	c, root := testConfig(t)
+	fakeDocker := filepath.Join(root, "fake-docker")
+	if err := os.WriteFile(fakeDocker, []byte("#!/bin/sh\nprintf 'SKILL2API_INPUT_REQUIRED\\n{\\\"question\\\":\\\"Provide provider credentials\\\",\\\"options\\\":[\\\"configure credentials\\\"]}\\n'\nprintf 'session id: docker-session-1\\n' >&2\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c.CodexDocker, c.CodexDockerBin = true, fakeDocker
+	req := generateRequest{RequestID: "request-1", SkillName: "demo", OutputDir: filepath.Join(root, "request-1"), Prompt: "Create the requested video."}
+	store := &statusStore{root: root}
+	if err := store.create(taskStatus{RequestID: req.RequestID, Status: "queued", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), SkillName: req.SkillName, OutputDir: req.OutputDir}, false); err != nil {
+		t.Fatal(err)
+	}
+	execute(store, newTaskManager(), c, req)
+	got, err := store.read(req.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "waiting_for_input" || got.Question != "Provide provider credentials" || got.SessionID != "docker-session-1" || got.FinishedAt != "" {
+		t.Fatalf("Docker execution status = %#v", got)
+	}
+}
+
+func TestDockerResumeMarksInputRequiredInsteadOfSucceeded(t *testing.T) {
+	c, root := testConfig(t)
+	fakeDocker := filepath.Join(root, "fake-docker")
+	if err := os.WriteFile(fakeDocker, []byte("#!/bin/sh\nprintf 'SKILL2API_INPUT_REQUIRED\\n{\\\"question\\\":\\\"Choose a model\\\",\\\"options\\\":[\\\"model-a\\\",\\\"model-b\\\"]}\\n'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c.CodexDocker, c.CodexDockerBin = true, fakeDocker
+	outputDir := filepath.Join(root, "request-1")
+	if err := os.MkdirAll(outputDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	store := &statusStore{root: root}
+	v := taskStatus{RequestID: "request-1", Status: "running", StartedAt: time.Now().UTC().Format(time.RFC3339Nano), OutputDir: outputDir, SessionID: "docker-session-1"}
+	if err := store.write(v); err != nil {
+		t.Fatal(err)
+	}
+	executeResume(store, newTaskManager(), c, resumeRequest{RequestID: v.RequestID, Answer: "continue"}, v)
+	got, err := store.read(v.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "waiting_for_input" || got.Question != "Choose a model" || !reflect.DeepEqual(got.Options, []string{"model-a", "model-b"}) || got.FinishedAt != "" {
+		t.Fatalf("Docker resume status = %#v", got)
+	}
+}
+
+func TestDockerResumeIgnoresPriorInputMarkerWhenNewRunIsSilent(t *testing.T) {
+	c, root := testConfig(t)
+	fakeDocker := filepath.Join(root, "fake-docker")
+	if err := os.WriteFile(fakeDocker, []byte("#!/bin/sh\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c.CodexDocker, c.CodexDockerBin = true, fakeDocker
+	outputDir := filepath.Join(root, "request-1")
+	if err := os.MkdirAll(outputDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outputDir, stdoutLogName), []byte("SKILL2API_INPUT_REQUIRED\n{\"question\":\"Previous question\"}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store := &statusStore{root: root}
+	v := taskStatus{RequestID: "request-1", Status: "running", StartedAt: time.Now().UTC().Format(time.RFC3339Nano), OutputDir: outputDir, SessionID: "docker-session-1"}
+	if err := store.write(v); err != nil {
+		t.Fatal(err)
+	}
+	executeResume(store, newTaskManager(), c, resumeRequest{RequestID: v.RequestID, Answer: "continue"}, v)
+	got, err := store.read(v.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "succeeded" || got.Question != "" || got.FinishedAt == "" {
+		t.Fatalf("silent Docker resume status = %#v", got)
+	}
 }
 
 func TestCodexPromptPreservesCallerPromptAndSkillVerbatim(t *testing.T) {
@@ -268,7 +351,7 @@ func TestDockerCodexCommandIsolatedAndReceivesExplicitEnvironment(t *testing.T) 
 	if err := os.MkdirAll(outputDir, 0750); err != nil {
 		t.Fatal(err)
 	}
-	cmd, executable, err := newCodexCommand(context.Background(), c, "request-1", outputDir, map[string]string{"SANDBOX_AI_KEY": "client-key", "OTHER_TOKEN": "other-value"}, codexExecArgs(c, "", outputDir, []string{"prompt"}))
+	cmd, executable, err := newCodexCommand(context.Background(), c, "-request-1", outputDir, map[string]string{"SANDBOX_AI_KEY": "client-key", "OTHER_TOKEN": "other-value"}, codexExecArgs(c, "", outputDir, []string{"prompt"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +359,7 @@ func TestDockerCodexCommandIsolatedAndReceivesExplicitEnvironment(t *testing.T) 
 		t.Fatalf("unexpected executable: %q (%q)", executable, cmd.Path)
 	}
 	joined := strings.Join(cmd.Args, "\n")
-	for _, want := range []string{"run", "--init", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), "dst=/workspace", "dst=/home/ubuntu", "--workdir\n/workspace", "--env\nHOME=/home/ubuntu", "--env\nSANDBOX_AI_KEY", "--env\nOTHER_TOKEN", "example/sandbox:tag\ncodex\nexec", "--sandbox\ndanger-full-access", "--cd\n/workspace"} {
+	for _, want := range []string{"run", "--rm", "--name\nskill2api--request-1", "--init", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), "dst=/workspace", "dst=/home/ubuntu", "--workdir\n/workspace", "--env\nHOME=/home/ubuntu", "--env\nSANDBOX_AI_KEY", "--env\nOTHER_TOKEN", "example/sandbox:tag\ncodex\nexec", "--sandbox\ndanger-full-access", "--cd\n/workspace"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("docker command missing %q: %q", want, joined)
 		}
@@ -293,13 +376,13 @@ func TestDockerCodexCommandIsolatedAndReceivesExplicitEnvironment(t *testing.T) 
 	if strings.Contains(joined, "client-key") || strings.Contains(joined, "other-value") {
 		t.Fatalf("docker command exposed environment values: %q", joined)
 	}
-	if !strings.Contains(joined, codexHomeDir(c, "request-1")) {
+	if !strings.Contains(joined, codexHomeDir(c, "-request-1")) {
 		t.Fatalf("docker command did not mount persistent home: %q", joined)
 	}
-	if _, err := os.Stat(codexHomeDir(c, "request-1")); err != nil {
+	if _, err := os.Stat(codexHomeDir(c, "-request-1")); err != nil {
 		t.Fatalf("persistent home was not created: %v", err)
 	}
-	configPath := filepath.Join(codexHomeDir(c, "request-1"), ".codex", "config.toml")
+	configPath := filepath.Join(codexHomeDir(c, "-request-1"), ".codex", "config.toml")
 	configData, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatalf("read Docker Codex config: %v", err)
@@ -319,6 +402,50 @@ func TestDockerCodexCommandIsolatedAndReceivesExplicitEnvironment(t *testing.T) 
 	}
 	if !strings.Contains(strings.Join(cmd.Env, "\n"), "SANDBOX_AI_KEY=client-key") {
 		t.Fatalf("client key was not forwarded to Docker: %#v", cmd.Env)
+	}
+}
+
+func TestRemoveDockerContainer(t *testing.T) {
+	root := t.TempDir()
+	capture := filepath.Join(root, "args")
+	success := filepath.Join(root, "docker-success")
+	if err := os.WriteFile(success, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CAPTURE", capture)
+	c := config{CodexDocker: true, CodexDockerBin: success}
+	if err := removeDockerContainer(context.Background(), c, "request-1"); err != nil {
+		t.Fatalf("remove Docker container: %v", err)
+	}
+	args, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(args) != "rm\n--force\nskill2api-request-1\n" {
+		t.Fatalf("docker removal args = %q", args)
+	}
+
+	missing := filepath.Join(root, "docker-missing")
+	if err := os.WriteFile(missing, []byte("#!/bin/sh\necho 'Error response from daemon: No such container: skill2api-request-1' >&2\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c.CodexDockerBin = missing
+	if err := removeDockerContainer(context.Background(), c, "request-1"); err != nil {
+		t.Fatalf("missing Docker container should be ignored: %v", err)
+	}
+
+	failure := filepath.Join(root, "docker-failure")
+	if err := os.WriteFile(failure, []byte("#!/bin/sh\necho daemon unavailable >&2\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c.CodexDockerBin = failure
+	if err := removeDockerContainer(context.Background(), c, "request-1"); err == nil || !strings.Contains(err.Error(), "daemon unavailable") {
+		t.Fatalf("unexpected Docker removal error: %v", err)
+	}
+
+	c.CodexDocker = false
+	if err := removeDockerContainer(context.Background(), c, "request-1"); err != nil {
+		t.Fatalf("native execution should skip Docker removal: %v", err)
 	}
 }
 

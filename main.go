@@ -37,6 +37,7 @@ const (
 	retentionAge      = 24 * time.Hour
 	stdoutLogName     = "stdout.log"
 	stderrLogName     = "stderr.log"
+	maxInputTailBytes = 16 * 1024
 	dockerCodexConfig = `sandbox_mode = "danger-full-access"
 model_provider = "sandbox_runner"
 model = "gpt-5.6-luna"
@@ -685,24 +686,30 @@ type inputRequest struct {
 }
 
 func parseInputRequest(stdout string) (inputRequest, bool, error) {
-	lines := strings.Split(stdout, "\n")
-	for i, line := range lines {
-		if strings.TrimSpace(line) != "SKILL2API_INPUT_REQUIRED" {
-			continue
-		}
-		if i+1 >= len(lines) {
-			return inputRequest{}, true, errors.New("input request JSON is missing")
-		}
-		var request inputRequest
-		if err := json.Unmarshal([]byte(strings.TrimSpace(lines[i+1])), &request); err != nil {
-			return inputRequest{}, true, fmt.Errorf("invalid input request: %w", err)
-		}
-		if strings.TrimSpace(request.Question) == "" {
-			return inputRequest{}, true, errors.New("input request question is empty")
-		}
-		return request, true, nil
+	lines := strings.Split(strings.TrimRight(stdout, "\r\n"), "\n")
+	if len(lines) < 2 || strings.TrimSpace(lines[len(lines)-2]) != "SKILL2API_INPUT_REQUIRED" {
+		return inputRequest{}, false, nil
 	}
-	return inputRequest{}, false, nil
+	var request inputRequest
+	if err := json.Unmarshal([]byte(strings.TrimSpace(lines[len(lines)-1])), &request); err != nil {
+		return inputRequest{}, true, fmt.Errorf("invalid input request: %w", err)
+	}
+	if strings.TrimSpace(request.Question) == "" {
+		return inputRequest{}, true, errors.New("input request question is empty")
+	}
+	return request, true, nil
+}
+
+func inputRequestFromLog(outputDir string) (inputRequest, bool, error) {
+	return inputRequestFromLogSince(outputDir, 0)
+}
+
+func inputRequestFromLogSince(outputDir string, offset int64) (inputRequest, bool, error) {
+	stdout, err := readOutputTailSince(filepath.Join(outputDir, stdoutLogName), offset, maxInputTailBytes)
+	if err != nil {
+		return inputRequest{}, true, fmt.Errorf("read %s: %w", stdoutLogName, err)
+	}
+	return parseInputRequest(stdout)
 }
 
 func sessionIDFromStderr(stderr string) string {
@@ -869,6 +876,28 @@ func dockerEnvironment(c config, environment map[string]string) map[string]strin
 	return merged
 }
 
+func removeDockerContainer(ctx context.Context, c config, requestID string) error {
+	if !c.CodexDocker {
+		return nil
+	}
+	containerName := dockerContainerName(requestID)
+	cmd := exec.CommandContext(ctx, c.CodexDockerBin, "rm", "--force", containerName)
+	output, err := cmd.CombinedOutput()
+	if err == nil || strings.Contains(string(output), "No such container") {
+		return nil
+	}
+	message := strings.TrimSpace(string(output))
+	if message == "" {
+		return fmt.Errorf("remove Docker container %q: %w", containerName, err)
+	}
+	return fmt.Errorf("remove Docker container %q: %w: %s", containerName, err, message)
+}
+
+func dockerContainerName(requestID string) string {
+	// Docker requires names to start with an alphanumeric character, unlike valid request IDs.
+	return "skill2api-" + requestID
+}
+
 func newCodexCommand(ctx context.Context, c config, requestID, outputDir string, environment map[string]string, args []string) (*exec.Cmd, string, error) {
 	if !c.CodexDocker {
 		home := codexHomeDir(c, requestID)
@@ -891,7 +920,7 @@ func newCodexCommand(ctx context.Context, c config, requestID, outputDir string,
 	if err := prepareDockerCodexHome(home); err != nil {
 		return nil, c.CodexDockerBin, err
 	}
-	dockerArgs := []string{"run", "--init", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())}
+	dockerArgs := []string{"run", "--rm", "--name", dockerContainerName(requestID), "--init", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())}
 	dockerArgs = append(dockerArgs,
 		"--mount", "type=bind,src="+outputDir+",dst=/workspace",
 		"--mount", "type=bind,src="+home+",dst=/home/ubuntu",
@@ -1314,11 +1343,10 @@ func execute(store *statusStore, manager *taskManager, c config, req generateReq
 		log.Printf("event=skill2api_state request_id=%s status=failed error=%q", req.RequestID, v.Error)
 		return
 	}
-	var stdout string
 	skill, err := os.ReadFile(filepath.Join(c.SkillsDir, req.SkillName, "SKILL.md"))
 	if err == nil {
 		var sessionID string
-		stdout, _, sessionID, err = runCodexWithSessionCallback(ctx, c, req, skill, func(sessionID string) {
+		_, _, sessionID, err = runCodexWithSessionCallback(ctx, c, req, skill, func(sessionID string) {
 			if updateErr := store.updateSessionID(req.RequestID, v.StartedAt, sessionID); updateErr != nil {
 				log.Printf("event=skill2api_session request_id=%s result=persist_failed error=%q", req.RequestID, updateErr)
 			}
@@ -1337,7 +1365,7 @@ func execute(store *statusStore, manager *taskManager, c config, req generateReq
 		log.Printf("event=skill2api_state request_id=%s status=failed error=%q", req.RequestID, v.Error)
 		return
 	}
-	if input, needed, parseErr := parseInputRequest(stdout); needed {
+	if input, needed, parseErr := inputRequestFromLog(req.OutputDir); needed {
 		if parseErr != nil || v.SessionID == "" {
 			if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
 				return
@@ -1386,8 +1414,10 @@ func executeResume(store *statusStore, manager *taskManager, c config, req resum
 		cancel()
 		return
 	}
-	var err error
-	stdout, _, err := runCodexResume(ctx, c, v, req.Answer, req.Instruction, req.Environment)
+	stdoutOffset, err := outputLogSize(filepath.Join(v.OutputDir, stdoutLogName))
+	if err == nil {
+		_, _, err = runCodexResume(ctx, c, v, req.Answer, req.Instruction, req.Environment)
+	}
 	cancel()
 	if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
 		return
@@ -1396,7 +1426,7 @@ func executeResume(store *statusStore, manager *taskManager, c config, req resum
 	if err != nil {
 		v.Status = "failed"
 		v.Error = err.Error()
-	} else if input, needed, parseErr := parseInputRequest(stdout); needed {
+	} else if input, needed, parseErr := inputRequestFromLogSince(v.OutputDir, stdoutOffset); needed {
 		if parseErr != nil {
 			v.Status, v.Error = "failed", parseErr.Error()
 		} else {
@@ -1632,7 +1662,7 @@ func handleResume(job periodic.Job, store *statusStore, manager *taskManager, c 
 	go executeResume(store, manager, c, req, v)
 }
 
-func handleTerminate(job periodic.Job, store *statusStore, manager *taskManager) {
+func handleTerminate(job periodic.Job, store *statusStore, manager *taskManager, c config) {
 	var req terminateRequest
 	if strings.TrimSpace(job.Args) != "" {
 		if err := parseArgs(job, &req); err != nil {
@@ -1661,6 +1691,13 @@ func handleTerminate(job periodic.Job, store *statusStore, manager *taskManager)
 	}
 	if v.Status == "terminated" {
 		manager.cancel(req.RequestID)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := removeDockerContainer(ctx, c, req.RequestID); err != nil {
+			log.Printf("event=skill2api_terminate request_id=%s result=container_cleanup_failed error=%q", req.RequestID, err)
+			doneJSON(job, map[string]any{"request_id": req.RequestID, "status": v.Status, "error": err.Error()})
+			return
+		}
 	}
 	doneJSON(job, map[string]any{"request_id": req.RequestID, "status": v.Status, "error": v.Error})
 }
@@ -1721,7 +1758,7 @@ func registerWorkerFuncs(worker *periodic.Worker, prefix string, store *statusSt
 	if err := addWorkerFunc(worker, prefix, resumeFunc, func(job periodic.Job) { handleResume(job, store, manager, c) }); err != nil {
 		return err
 	}
-	if err := addWorkerFunc(worker, prefix, terminateFunc, func(job periodic.Job) { handleTerminate(job, store, manager) }); err != nil {
+	if err := addWorkerFunc(worker, prefix, terminateFunc, func(job periodic.Job) { handleTerminate(job, store, manager, c) }); err != nil {
 		return err
 	}
 	return addWorkerFunc(worker, prefix, cleanupFunc, func(job periodic.Job) { handleCleanup(job, store, c) })
