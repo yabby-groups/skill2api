@@ -1324,6 +1324,9 @@ func TestConfigPlainModeUsesPeriodicSettings(t *testing.T) {
 	if c.Timeout != 6*time.Hour {
 		t.Fatalf("default Codex timeout = %s, want %s", c.Timeout, 6*time.Hour)
 	}
+	if c.UploadTimeout != fileUploadTimeout {
+		t.Fatalf("default upload timeout = %s, want %s", c.UploadTimeout, fileUploadTimeout)
+	}
 	if c.CodexNoProxy || c.CodexDocker || c.Debug || c.CodexDockerBin != "docker" || c.CodexDockerImage != "lupino/sandbox-runner:latest" {
 		t.Fatalf("direct provider settings should default to false: %#v", c)
 	}
@@ -1361,6 +1364,24 @@ func TestConfigCodexTimeoutOverride(t *testing.T) {
 	}
 	if c.Timeout != 8*time.Hour {
 		t.Fatalf("Codex timeout override = %s, want %s", c.Timeout, 8*time.Hour)
+	}
+}
+
+func TestConfigUploadTimeoutOverride(t *testing.T) {
+	t.Setenv("PERIODIC_PORT", "tcp://periodic:5000")
+	t.Setenv("PERIODIC_RSA_MODE", "0")
+	t.Setenv("SKILL2API_OUTPUT_ROOT", t.TempDir())
+	t.Setenv("SKILL2API_FILE_UPLOAD_TIMEOUT_SECONDS", "180")
+	c, err := newConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.UploadTimeout != 3*time.Minute {
+		t.Fatalf("upload timeout override = %s, want %s", c.UploadTimeout, 3*time.Minute)
+	}
+	t.Setenv("SKILL2API_FILE_UPLOAD_TIMEOUT_SECONDS", "0")
+	if _, err := newConfig(); err == nil || !strings.Contains(err.Error(), "SKILL2API_FILE_UPLOAD_TIMEOUT_SECONDS") {
+		t.Fatalf("invalid upload timeout error = %v", err)
 	}
 }
 

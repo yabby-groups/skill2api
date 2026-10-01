@@ -108,6 +108,10 @@ clients receive the unencoded job data directly.
 
 `SKILL2API_MAX_FILE_BYTES` limits one read and defaults to 67108864 bytes
 (64 MiB). Files over the limit are rejected without returning partial data.
+`SKILL2API_FILE_UPLOAD_TIMEOUT_SECONDS` controls the per-attempt timeout for
+temporary uploads and defaults to 45 seconds. Increase it when the upstream
+file service needs longer to accept large media; retries remain limited to
+three attempts.
 
 ## Asynchronous Temporary Delivery
 
@@ -119,7 +123,7 @@ also includes the source `request_id`, `file_path`, and worker-only
 Before transferring bytes, the worker derives the Myna-compatible `file_key`
 from the output and resolves any unexpired temporary object with that key.
 Resolved content is reused globally. Otherwise the worker attempts the
-temporary upload up to three times, with a 45-second limit per attempt.
+temporary upload up to three times, with the configured per-attempt timeout.
 
 Poll `skill2api_file_delivery_status` with the same delivery job name and a
 workload containing `request_id` and `delivery_id`. It returns `queued`,

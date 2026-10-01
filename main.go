@@ -202,6 +202,7 @@ type config struct {
 	CodexNoProxy      bool
 	Debug             bool
 	UploadBaseURL     string
+	UploadTimeout     time.Duration
 	Timeout           time.Duration
 	MaxOutput         int
 	MaxFileBytes      int
@@ -277,6 +278,10 @@ func newConfig() (config, error) {
 	if fileLimit < 1 {
 		fileLimit = maxFileBytes
 	}
+	uploadTimeout := envDuration("SKILL2API_FILE_UPLOAD_TIMEOUT_SECONDS", fileUploadTimeout)
+	if uploadTimeout <= 0 {
+		return config{}, errors.New("SKILL2API_FILE_UPLOAD_TIMEOUT_SECONDS must be positive")
+	}
 	noProxy, err := strconv.ParseBool(firstEnvDefault("SKILL2API_CODEX_NO_PROXY", "false"))
 	if err != nil {
 		return config{}, errors.New("SKILL2API_CODEX_NO_PROXY must be true or false")
@@ -308,7 +313,7 @@ func newConfig() (config, error) {
 	if err != nil || uploadURL.Scheme == "" || uploadURL.Host == "" {
 		return config{}, errors.New("SKILL2API_UPLOAD_BASE_URL must be an absolute URL")
 	}
-	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexDockerOptDir: optDir, CodexNoProxy: noProxy, Debug: debug, UploadBaseURL: uploadBaseURL, Timeout: timeout, MaxOutput: limit, MaxFileBytes: fileLimit}, nil
+	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexDockerOptDir: optDir, CodexNoProxy: noProxy, Debug: debug, UploadBaseURL: uploadBaseURL, UploadTimeout: uploadTimeout, Timeout: timeout, MaxOutput: limit, MaxFileBytes: fileLimit}, nil
 }
 func firstEnvDefault(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -1750,9 +1755,13 @@ func uploadTemporaryFile(ctx context.Context, c config, req fileRequest, data []
 }
 
 func uploadTemporaryFileWithRetry(c config, req fileRequest, data []byte) (json.RawMessage, string, int, error) {
+	uploadTimeout := c.UploadTimeout
+	if uploadTimeout <= 0 {
+		uploadTimeout = fileUploadTimeout
+	}
 	var lastErr error
 	for attempt := 1; attempt <= fileUploadAttempts; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), fileUploadTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 		file, uploadURL, err := uploadTemporaryFile(ctx, c, req, data)
 		cancel()
 		if err == nil {
@@ -2078,7 +2087,11 @@ func handleFile(job periodic.Job, store *statusStore, c config) {
 		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "failed", "error": err.Error()})
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), fileUploadTimeout)
+	uploadTimeout := c.UploadTimeout
+	if uploadTimeout <= 0 {
+		uploadTimeout = fileUploadTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 	file, uploadURL, err := uploadTemporaryFile(ctx, c, req, data)
 	cancel()
 	if err != nil {
