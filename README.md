@@ -55,9 +55,9 @@ job name. The normal states are:
 | --- | --- |
 | `queued` | The job was created and is waiting to run. |
 | `running` | Codex is executing the skill. |
-| `interrupted` | Worker restarted after saving the Codex session; it can be resumed. |
+| `interrupted` | Worker restarted or Docker execution ended before Codex emitted its completion summary; when a session was saved, it can be resumed. |
 | `waiting_for_input` | The skill asked a question and is waiting for an answer. |
-| `succeeded` | The task completed; `files` lists files by modification time, oldest first. |
+| `succeeded` | The task completed and Codex emitted its token-usage completion summary; `files` lists files by modification time, oldest first. |
 | `failed` | Execution failed; inspect `error`, `stdout`, and `stderr`. |
 | `terminated` | The task was stopped by an explicit terminate request. |
 | `not_found` | No job exists for the requested ID. |

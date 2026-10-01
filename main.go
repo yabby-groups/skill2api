@@ -929,6 +929,40 @@ func parseInputRequest(stdout string) (inputRequest, bool, error) {
 	return request, true, nil
 }
 
+func hasTokenUsageSummary(output string) bool {
+	lines := strings.Split(strings.TrimRight(output, "\r\n"), "\n")
+	end := len(lines)
+	for end > 0 && strings.TrimSpace(lines[end-1]) == "" {
+		end--
+	}
+	if end < 2 || !strings.Contains(strings.ToLower(strings.TrimSpace(lines[end-2])), "tokens used") {
+		return false
+	}
+	for _, field := range strings.Fields(strings.TrimSpace(lines[end-1])) {
+		if !numericTokenField(field) {
+			return false
+		}
+	}
+	return strings.TrimSpace(lines[end-1]) != ""
+}
+
+func numericTokenField(value string) bool {
+	value = strings.Trim(value, ",")
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r != ',' && (r < '0' || r > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func interruptedDockerExecution(c config, sessionID, stderr string) bool {
+	return c.CodexDocker && sessionID != "" && !hasTokenUsageSummary(stderr)
+}
+
 func inputRequestFromLog(outputDir string) (inputRequest, bool, error) {
 	return inputRequestFromLogSince(outputDir, 0)
 }
@@ -1741,10 +1775,11 @@ func execute(store *statusStore, manager *taskManager, c config, req generateReq
 		log.Printf("event=skill2api_state request_id=%s status=failed error=%q", req.RequestID, v.Error)
 		return
 	}
+	var stderr string
 	skills, names, err := readSkills(c, req.SkillName)
 	if err == nil {
 		var sessionID string
-		_, _, sessionID, err = runCodexWithSessionCallbackSkills(ctx, c, req, skills, names, func(sessionID string) {
+		_, stderr, sessionID, err = runCodexWithSessionCallbackSkills(ctx, c, req, skills, names, func(sessionID string) {
 			if updateErr := store.updateSessionID(req.RequestID, v.StartedAt, sessionID); updateErr != nil {
 				log.Printf("event=skill2api_session request_id=%s result=persist_failed error=%q", req.RequestID, updateErr)
 			}
@@ -1756,11 +1791,19 @@ func execute(store *statusStore, manager *taskManager, c config, req generateReq
 		if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
 			return
 		}
-		v.Status = "failed"
-		v.Error = err.Error()
+		if interruptedDockerExecution(c, v.SessionID, stderr) {
+			v.Status = "interrupted"
+			v.Error = "Docker execution interrupted before token usage was recorded"
+		} else {
+			v.Status = "failed"
+			v.Error = err.Error()
+		}
 		v.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		if v.Status == "interrupted" {
+			v.FinishedAt = ""
+		}
 		_ = store.write(v)
-		log.Printf("event=skill2api_state request_id=%s status=failed error=%q", req.RequestID, v.Error)
+		log.Printf("event=skill2api_state request_id=%s status=%s error=%q", req.RequestID, v.Status, v.Error)
 		return
 	}
 	if input, needed, parseErr := inputRequestFromLog(req.OutputDir); needed {
@@ -1791,6 +1834,22 @@ func execute(store *statusStore, manager *taskManager, c config, req generateReq
 		return
 	}
 	if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
+		return
+	}
+	stderr, readErr := readOutputTail(filepath.Join(req.OutputDir, stderrLogName), c.MaxOutput)
+	if readErr != nil {
+		v.Status = "failed"
+		v.Error = fmt.Errorf("read %s: %w", stderrLogName, readErr).Error()
+		v.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		_, _ = store.writeFromRunning(v)
+		return
+	}
+	if interruptedDockerExecution(c, v.SessionID, stderr) {
+		v.Status = "interrupted"
+		v.Error = "Docker execution ended without token usage summary"
+		v.FinishedAt = ""
+		_, _ = store.writeFromRunning(v)
+		log.Printf("event=skill2api_state request_id=%s status=interrupted reason=missing_token_usage", req.RequestID)
 		return
 	}
 	v.Status = "succeeded"
@@ -1833,6 +1892,17 @@ func executeResume(store *statusStore, manager *taskManager, c config, req resum
 			v.Error = ""
 		}
 	} else {
+		stderr, readErr := readOutputTail(filepath.Join(v.OutputDir, stderrLogName), c.MaxOutput)
+		if readErr != nil {
+			v.Status, v.Error = "failed", fmt.Sprintf("read %s: %v", stderrLogName, readErr)
+		} else if c.CodexDocker && v.SessionID != "" && !hasTokenUsageSummary(stderr) {
+			v.Status, v.Error = "interrupted", "Docker execution ended without token usage summary"
+		}
+		if v.Status == "interrupted" {
+			v.FinishedAt = ""
+			_, _ = store.writeFromRunning(v)
+			return
+		}
 		v.Status = "succeeded"
 		v.Files, err = listFiles(v.OutputDir)
 		if err != nil {

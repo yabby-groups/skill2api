@@ -370,6 +370,37 @@ func TestParseInputRequest(t *testing.T) {
 	}
 }
 
+func TestHasTokenUsageSummary(t *testing.T) {
+	if !hasTokenUsageSummary("finished\ntokens used\n21,712\n") {
+		t.Fatal("token usage summary was not detected")
+	}
+	if hasTokenUsageSummary("finished\n464 tokens\n") {
+		t.Fatal("incomplete token usage summary was accepted")
+	}
+}
+
+func TestDockerExecutionWithoutTokenUsageIsInterrupted(t *testing.T) {
+	c, root := testConfig(t)
+	fakeDocker := filepath.Join(root, "fake-docker")
+	if err := os.WriteFile(fakeDocker, []byte("#!/bin/sh\nprintf 'session id: docker-session-1\\n' >&2\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c.CodexDocker, c.CodexDockerBin = true, fakeDocker
+	req := generateRequest{RequestID: "request-1", SkillName: "demo", OutputDir: filepath.Join(root, "request-1"), Prompt: "Create the requested video."}
+	store := &statusStore{root: root}
+	if err := store.create(taskStatus{RequestID: req.RequestID, Status: "queued", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), SkillName: req.SkillName, OutputDir: req.OutputDir}, false); err != nil {
+		t.Fatal(err)
+	}
+	execute(store, newTaskManager(), c, req)
+	got, err := store.read(req.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "interrupted" || got.FinishedAt != "" {
+		t.Fatalf("Docker execution status = %#v", got)
+	}
+}
+
 func TestDockerExecutionMarksInputRequiredInsteadOfSucceeded(t *testing.T) {
 	c, root := testConfig(t)
 	fakeDocker := filepath.Join(root, "fake-docker")
@@ -442,7 +473,7 @@ func TestDockerResumeIgnoresPriorInputMarkerWhenNewRunIsSilent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != "succeeded" || got.Question != "" || got.FinishedAt == "" {
+	if got.Status != "interrupted" || got.Question != "" || got.FinishedAt != "" {
 		t.Fatalf("silent Docker resume status = %#v", got)
 	}
 }
