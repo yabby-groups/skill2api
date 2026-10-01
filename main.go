@@ -693,8 +693,8 @@ func validateRequest(req generateRequest, c config) error {
 	if !validID(req.RequestID) {
 		return errors.New("request_id must contain only letters, digits, dot, underscore, or hyphen")
 	}
-	if strings.TrimSpace(req.SkillName) == "" || len(req.SkillName) > maxSkillName || filepath.Base(req.SkillName) != req.SkillName || strings.Contains(req.SkillName, "..") {
-		return errors.New("invalid skill_name")
+	if _, err := skillNames(c, req.SkillName); err != nil {
+		return err
 	}
 	if strings.TrimSpace(req.Prompt) == "" {
 		return errors.New("prompt is required")
@@ -708,17 +708,118 @@ func validateRequest(req generateRequest, c config) error {
 	if _, err := resolveOutputDir(req.OutputDir, c.OutputRoot); err != nil {
 		return err
 	}
+	return nil
+}
+
+// skillNames parses the public comma-separated skill_name field and verifies
+// that every selected package remains within the configured skills directory.
+func skillNames(c config, raw string) ([]string, error) {
+	if len(raw) > maxSkillName || strings.TrimSpace(raw) == "" {
+		return nil, errors.New("invalid skill_name")
+	}
 	skillRoot, err := filepath.Abs(c.SkillsDir)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if !within(skillRoot, filepath.Join(skillRoot, req.SkillName)) {
-		return errors.New("invalid skill_name")
+	resolvedRoot, err := filepath.EvalSymlinks(skillRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve skills directory: %w", err)
 	}
-	if _, err = os.Stat(filepath.Join(skillRoot, req.SkillName, "SKILL.md")); err != nil {
-		return fmt.Errorf("skill not found: %w", err)
+	seen := make(map[string]struct{})
+	names := make([]string, 0, strings.Count(raw, ",")+1)
+	for _, part := range strings.Split(raw, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" || filepath.Base(name) != name || strings.Contains(name, "..") {
+			return nil, errors.New("invalid skill_name")
+		}
+		if _, exists := seen[name]; exists {
+			return nil, errors.New("duplicate skill_name")
+		}
+		skillDir := filepath.Join(skillRoot, name)
+		if !within(skillRoot, skillDir) {
+			return nil, errors.New("invalid skill_name")
+		}
+		resolvedDir, err := filepath.EvalSymlinks(skillDir)
+		if err != nil || !within(resolvedRoot, resolvedDir) {
+			return nil, errors.New("invalid skill_name")
+		}
+		info, err := os.Stat(resolvedDir)
+		if err != nil {
+			return nil, fmt.Errorf("skill not found: %w", err)
+		}
+		if !info.IsDir() {
+			return nil, errors.New("skill not found: not a directory")
+		}
+		skillFile := filepath.Join(resolvedDir, "SKILL.md")
+		resolvedFile, err := filepath.EvalSymlinks(skillFile)
+		if err != nil || !within(resolvedDir, resolvedFile) {
+			return nil, errors.New("invalid skill_name")
+		}
+		if _, err := os.Stat(resolvedFile); err != nil {
+			return nil, fmt.Errorf("skill not found: %w", err)
+		}
+		if err := validateSkillResources(resolvedDir); err != nil {
+			return nil, err
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
 	}
-	return nil
+	return names, nil
+}
+
+func validateSkillResources(dir string) error {
+	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == dir || info.Mode()&os.ModeSymlink == 0 {
+			return nil
+		}
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil || !withinOrSame(dir, resolved) {
+			return errors.New("skill resource symlink escapes skill directory")
+		}
+		return nil
+	})
+}
+
+func withinOrSame(root, path string) bool {
+	return filepath.Clean(root) == filepath.Clean(path) || within(root, path)
+}
+
+func skillDir(c config, name string) (string, error) {
+	names, err := skillNames(c, name)
+	if err != nil || len(names) != 1 {
+		if err == nil {
+			err = errors.New("invalid skill_name")
+		}
+		return "", err
+	}
+	root, err := filepath.Abs(c.SkillsDir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(filepath.Join(root, names[0]))
+}
+
+func readSkills(c config, raw string) ([][]byte, []string, error) {
+	names, err := skillNames(c, raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	skills := make([][]byte, 0, len(names))
+	for _, name := range names {
+		dir, err := skillDir(c, name)
+		if err != nil {
+			return nil, nil, err
+		}
+		skill, err := os.ReadFile(filepath.Join(dir, "SKILL.md"))
+		if err != nil {
+			return nil, nil, fmt.Errorf("read skill %q: %w", name, err)
+		}
+		skills = append(skills, skill)
+	}
+	return skills, names, nil
 }
 
 func validateEnvironment(values map[string]string) error {
@@ -864,10 +965,33 @@ func codexPrompt(prompt string, skill []byte) string {
 	return prompt + "\n\n" + string(skill)
 }
 
+func codexPromptSkills(prompt string, skills [][]byte, names []string, docker bool) string {
+	if len(skills) == 1 && !docker {
+		return codexPrompt(prompt, skills[0])
+	}
+	var out strings.Builder
+	out.WriteString(prompt)
+	for _, skill := range skills {
+		out.WriteString("\n\n")
+		out.Write(skill)
+	}
+	if docker {
+		out.WriteString("\n\nSelected skill packages are mounted read-only. Resolve package-relative resources using:\n")
+		for _, name := range names {
+			fmt.Fprintf(&out, "- %s: /workspace/skills/%s\n", name, name)
+		}
+	}
+	return out.String()
+}
+
 func runCodexWithSessionCallback(ctx context.Context, c config, req generateRequest, skill []byte, onSessionID func(string)) (string, string, string, error) {
+	return runCodexWithSessionCallbackSkills(ctx, c, req, [][]byte{skill}, nil, onSessionID)
+}
+
+func runCodexWithSessionCallbackSkills(ctx context.Context, c config, req generateRequest, skills [][]byte, names []string, onSessionID func(string)) (string, string, string, error) {
 	environment := codexRequestEnvironment(c, req.Environment)
 	redactions := append(redactionLines(req.Prompt), environmentRedactions(environment)...)
-	return runCodexCommand(ctx, c, req.RequestID, req.OutputDir, false, environment, redactions, onSessionID, codexExecArgs(c, req.Model, req.OutputDir, []string{codexPrompt(req.Prompt, skill)}))
+	return runCodexCommandSkills(ctx, c, req.RequestID, req.OutputDir, names, false, environment, redactions, onSessionID, codexExecArgs(c, req.Model, req.OutputDir, []string{codexPromptSkills(req.Prompt, skills, names, c.CodexDocker)}))
 }
 
 func runCodexResume(ctx context.Context, c config, req taskStatus, answer, instruction string, environment map[string]string) (string, string, error) {
@@ -879,14 +1003,30 @@ func runCodexResume(ctx context.Context, c config, req taskStatus, answer, instr
 		prompt += fmt.Sprintf("\n\nAdditional user instruction: %s", instruction)
 	}
 	prompt += "\n\nIf another clarification is required, end your response with exactly two lines: SKILL2API_INPUT_REQUIRED and then a JSON object containing question and optional options."
+	var names []string
+	if c.CodexDocker {
+		var err error
+		names, err = skillNames(c, req.SkillName)
+		if err != nil {
+			return "", "", err
+		}
+		prompt += "\n\nSelected skill packages remain mounted read-only:\n"
+		for _, name := range names {
+			prompt += fmt.Sprintf("- %s: /workspace/skills/%s\n", name, name)
+		}
+	}
 	environment = codexRequestEnvironment(c, environment)
 	redactions := append(redactionLines(answer), redactionLines(instruction)...)
 	redactions = append(redactions, environmentRedactions(environment)...)
-	stdout, stderr, _, err := runCodexCommand(ctx, c, req.RequestID, req.OutputDir, true, environment, redactions, nil, codexExecArgs(c, req.Model, req.OutputDir, []string{"resume", req.SessionID, prompt}))
+	stdout, stderr, _, err := runCodexCommandSkills(ctx, c, req.RequestID, req.OutputDir, names, true, environment, redactions, nil, codexExecArgs(c, req.Model, req.OutputDir, []string{"resume", req.SessionID, prompt}))
 	return stdout, stderr, err
 }
 
 func runCodexCommand(ctx context.Context, c config, requestID, outputDir string, appendLogs bool, environment map[string]string, redactions []string, onSessionID func(string), args []string) (string, string, string, error) {
+	return runCodexCommandSkills(ctx, c, requestID, outputDir, nil, appendLogs, environment, redactions, onSessionID, args)
+}
+
+func runCodexCommandSkills(ctx context.Context, c config, requestID, outputDir string, names []string, appendLogs bool, environment map[string]string, redactions []string, onSessionID func(string), args []string) (string, string, string, error) {
 	stdoutOffset, stderrOffset, err := outputLogOffsets(outputDir)
 	if err != nil {
 		return "", "", "", err
@@ -898,7 +1038,7 @@ func runCodexCommand(ctx context.Context, c config, requestID, outputDir string,
 	if err != nil {
 		return "", "", "", err
 	}
-	cmd, executable, err := newCodexCommand(ctx, c, requestID, outputDir, environment, args)
+	cmd, executable, err := newCodexCommandSkills(ctx, c, requestID, outputDir, names, environment, args)
 	if err != nil {
 		_ = stdoutLog.Close()
 		_ = stderrLog.Close()
@@ -1027,6 +1167,10 @@ func dockerContainerName(requestID string) string {
 }
 
 func newCodexCommand(ctx context.Context, c config, requestID, outputDir string, environment map[string]string, args []string) (*exec.Cmd, string, error) {
+	return newCodexCommandSkills(ctx, c, requestID, outputDir, nil, environment, args)
+}
+
+func newCodexCommandSkills(ctx context.Context, c config, requestID, outputDir string, names []string, environment map[string]string, args []string) (*exec.Cmd, string, error) {
 	if !c.CodexDocker {
 		home := codexHomeDir(c, requestID)
 		if err := os.MkdirAll(home, 0700); err != nil {
@@ -1055,6 +1199,13 @@ func newCodexCommand(ctx context.Context, c config, requestID, outputDir string,
 		"--workdir", "/workspace",
 		"--env", "HOME=/home/ubuntu",
 	)
+	for _, name := range names {
+		dir, err := skillDir(c, name)
+		if err != nil {
+			return nil, c.CodexDockerBin, err
+		}
+		dockerArgs = append(dockerArgs, "--mount", "type=bind,src="+dir+",dst=/workspace/skills/"+name+",readonly")
+	}
 	dockerEnv := dockerEnvironment(c, environment)
 	if c.CodexDockerOptDir != "" {
 		dockerArgs = append(dockerArgs, "--mount", "type=bind,src="+c.CodexDockerOptDir+",dst=/opt,readonly")
@@ -1072,7 +1223,7 @@ func newCodexCommand(ctx context.Context, c config, requestID, outputDir string,
 	// runs must include the executable that native exec.Command supplies.
 	dockerArgs = append(dockerArgs, c.CodexBin)
 	dockerArgs = append(dockerArgs, args...)
-	log.Printf("event=skill2api_codex_command mode=docker docker_bin=%s image=%s network_access=true opt_dir_mounted=%t output_dir=%s container_workdir=/workspace container_home=/home/ubuntu codex_subcommand=%s", c.CodexDockerBin, c.CodexDockerImage, c.CodexDockerOptDir != "", outputDir, codexSubcommand(args))
+	log.Printf("event=skill2api_codex_command mode=docker docker_bin=%s image=%s network_access=true opt_dir_mounted=%t skill_count=%d output_dir=%s container_workdir=/workspace container_home=/home/ubuntu codex_subcommand=%s", c.CodexDockerBin, c.CodexDockerImage, c.CodexDockerOptDir != "", len(names), outputDir, codexSubcommand(args))
 	cmd := exec.CommandContext(ctx, c.CodexDockerBin, dockerArgs...)
 	cmd.Env = codexEnvironment(os.Environ(), dockerEnv, c.CodexNoProxy)
 	return cmd, c.CodexDockerBin, nil
@@ -1590,10 +1741,10 @@ func execute(store *statusStore, manager *taskManager, c config, req generateReq
 		log.Printf("event=skill2api_state request_id=%s status=failed error=%q", req.RequestID, v.Error)
 		return
 	}
-	skill, err := os.ReadFile(filepath.Join(c.SkillsDir, req.SkillName, "SKILL.md"))
+	skills, names, err := readSkills(c, req.SkillName)
 	if err == nil {
 		var sessionID string
-		_, _, sessionID, err = runCodexWithSessionCallback(ctx, c, req, skill, func(sessionID string) {
+		_, _, sessionID, err = runCodexWithSessionCallbackSkills(ctx, c, req, skills, names, func(sessionID string) {
 			if updateErr := store.updateSessionID(req.RequestID, v.StartedAt, sessionID); updateErr != nil {
 				log.Printf("event=skill2api_session request_id=%s result=persist_failed error=%q", req.RequestID, updateErr)
 			}
@@ -1728,6 +1879,13 @@ func handleGenerate(job periodic.Job, store *statusStore, manager *taskManager, 
 		_ = job.Fail()
 		return
 	}
+	names, err := skillNames(c, req.SkillName)
+	if err != nil {
+		log.Printf("event=skill2api_generate request_id=%s result=validation_failed skill_name=%s output_dir=%s error=%q", req.RequestID, req.SkillName, req.OutputDir, err)
+		_ = job.Fail()
+		return
+	}
+	req.SkillName = strings.Join(names, ",")
 	outputDir, err := resolveOutputDir(req.OutputDir, c.OutputRoot)
 	if err != nil {
 		log.Printf("event=skill2api_generate request_id=%s result=validation_failed skill_name=%s output_dir=%s error=%q", req.RequestID, req.SkillName, req.OutputDir, err)

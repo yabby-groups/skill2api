@@ -11,7 +11,8 @@ user decision.
   `skill2api_file`, `skill2api_file_delivery`,
   `skill2api_file_delivery_status`, `skill2api_resume`,
   `skill2api_terminate`, and `skill2api_cleanup`.
-- `skill_name` resolves to `SKILL2API_SKILLS_DIR/<skill_name>/SKILL.md`.
+- `skill_name` is one skill name or an ordered comma-separated list. Each name
+  resolves to `SKILL2API_SKILLS_DIR/<skill_name>/SKILL.md`.
 - `output_dir` is a relative path inside `SKILL2API_OUTPUT_ROOT`.
 
 The examples below use `request-1`. The Periodic job name and the payload's
@@ -152,6 +153,14 @@ runner. Each container is named `skill2api-<request_id>` and uses Docker's
 `--rm` cleanup. `skill2api_terminate` force-removes that named container after
 cancelling the worker process. The prefix keeps Docker names valid when a
 request ID starts with `.`, `_`, or `-`.
+
+Only selected skill packages are also mounted, read-only, at
+`/workspace/skills/<skill_name>`. A multi-skill request uses an ordered,
+comma-separated `skill_name`, for example `"hypit,imagegen"`; Codex receives
+each selected `SKILL.md` in that order and a mapping to its package path.
+These namespaced mounts keep same-named resource directories such as
+`references/` independent. The worker does not mount the parent `skills/`
+directory or unselected packages. Existing single-skill requests remain valid.
 
 Before every Docker invocation, the worker writes the following
 provider configuration to the task's private

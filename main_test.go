@@ -238,6 +238,59 @@ func TestValidateRequestRejectsTraversalAndOutsideOutput(t *testing.T) {
 	}
 }
 
+func TestSkillNamesSupportsOrderedCommaSeparatedSelection(t *testing.T) {
+	c, _ := testConfig(t)
+	if err := os.MkdirAll(filepath.Join(c.SkillsDir, "second", "references"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(c.SkillsDir, "second", "SKILL.md"), []byte("second skill"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	names, err := skillNames(c, " demo, second ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"demo", "second"}; !reflect.DeepEqual(names, want) {
+		t.Fatalf("skill names = %#v, want %#v", names, want)
+	}
+	for _, value := range []string{"demo,,second", "demo,demo", "demo,../second", "demo,missing"} {
+		if _, err := skillNames(c, value); err == nil {
+			t.Fatalf("skill names %q unexpectedly accepted", value)
+		}
+	}
+	if err := validateRequest(generateRequest{RequestID: "request-1", SkillName: "demo, second", OutputDir: "request-1", Prompt: "Generate"}, c); err != nil {
+		t.Fatalf("multi-skill request rejected: %v", err)
+	}
+}
+
+func TestSkillNamesRejectsPackageSymlinkOutsideSkillsRoot(t *testing.T) {
+	c, _ := testConfig(t)
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "SKILL.md"), []byte("outside"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(c.SkillsDir, "outside")); err != nil {
+		t.Skipf("symbolic links unavailable: %v", err)
+	}
+	if _, err := skillNames(c, "outside"); err == nil {
+		t.Fatal("skill symlink outside configured skills directory was accepted")
+	}
+}
+
+func TestSkillNamesRejectsResourceSymlinkOutsideSkillPackage(t *testing.T) {
+	c, _ := testConfig(t)
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(c.SkillsDir, "demo", "references")); err != nil {
+		t.Skipf("symbolic links unavailable: %v", err)
+	}
+	if _, err := skillNames(c, "demo"); err == nil {
+		t.Fatal("skill resource symlink outside selected package was accepted")
+	}
+}
+
 func TestStatusStoreAtomicWriteAndRecovery(t *testing.T) {
 	store := &statusStore{root: t.TempDir()}
 	v := taskStatus{RequestID: "r1", Status: "running", CreatedAt: "created", SkillName: "demo", OutputDir: filepath.Join(store.root, "r1")}
@@ -351,7 +404,7 @@ func TestDockerResumeMarksInputRequiredInsteadOfSucceeded(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := &statusStore{root: root}
-	v := taskStatus{RequestID: "request-1", Status: "running", StartedAt: time.Now().UTC().Format(time.RFC3339Nano), OutputDir: outputDir, SessionID: "docker-session-1"}
+	v := taskStatus{RequestID: "request-1", Status: "running", StartedAt: time.Now().UTC().Format(time.RFC3339Nano), SkillName: "demo", OutputDir: outputDir, SessionID: "docker-session-1"}
 	if err := store.write(v); err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +433,7 @@ func TestDockerResumeIgnoresPriorInputMarkerWhenNewRunIsSilent(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := &statusStore{root: root}
-	v := taskStatus{RequestID: "request-1", Status: "running", StartedAt: time.Now().UTC().Format(time.RFC3339Nano), OutputDir: outputDir, SessionID: "docker-session-1"}
+	v := taskStatus{RequestID: "request-1", Status: "running", StartedAt: time.Now().UTC().Format(time.RFC3339Nano), SkillName: "demo", OutputDir: outputDir, SessionID: "docker-session-1"}
 	if err := store.write(v); err != nil {
 		t.Fatal(err)
 	}
@@ -503,6 +556,51 @@ func TestDockerCodexCommandIsolatedAndReceivesExplicitEnvironment(t *testing.T) 
 	}
 	if !strings.Contains(strings.Join(cmd.Env, "\n"), "SANDBOX_AI_KEY=client-key") {
 		t.Fatalf("client key was not forwarded to Docker: %#v", cmd.Env)
+	}
+}
+
+func TestDockerCodexCommandMountsOnlySelectedSkillPackages(t *testing.T) {
+	c, root := testConfig(t)
+	c.CodexDocker, c.CodexDockerBin, c.CodexDockerImage = true, "docker-test", "example/sandbox:tag"
+	for _, name := range []string{"hypit", "imagegen", "unselected"} {
+		if err := os.MkdirAll(filepath.Join(c.SkillsDir, name, "references"), 0750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(c.SkillsDir, name, "SKILL.md"), []byte(name+" skill"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outputDir := filepath.Join(root, "request-1")
+	if err := os.MkdirAll(outputDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	cmd, _, err := newCodexCommandSkills(context.Background(), c, "request-1", outputDir, []string{"hypit", "imagegen"}, nil, []string{"exec"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(cmd.Args, "\n")
+	for _, name := range []string{"hypit", "imagegen"} {
+		dir, err := skillDir(c, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "src=" + dir + ",dst=/workspace/skills/" + name + ",readonly"
+		if !strings.Contains(joined, want) {
+			t.Fatalf("Docker command missing selected skill mount %q: %q", want, cmd.Args)
+		}
+	}
+	if strings.Contains(joined, "unselected") || strings.Contains(joined, "src="+c.SkillsDir+",dst=/workspace/skills") {
+		t.Fatalf("Docker command exposed unselected skills: %q", cmd.Args)
+	}
+}
+
+func TestCodexPromptSkillsPreservesContentAndAddsDockerResourceMap(t *testing.T) {
+	prompt := "Make the deliverable."
+	skills := [][]byte{[]byte("first skill"), []byte("second skill")}
+	got := codexPromptSkills(prompt, skills, []string{"hypit", "imagegen"}, true)
+	want := prompt + "\n\nfirst skill\n\nsecond skill\n\nSelected skill packages are mounted read-only. Resolve package-relative resources using:\n- hypit: /workspace/skills/hypit\n- imagegen: /workspace/skills/imagegen\n"
+	if got != want {
+		t.Fatalf("multi-skill Docker prompt = %q, want %q", got, want)
 	}
 }
 
