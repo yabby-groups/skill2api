@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import mimetypes
 import os
@@ -30,6 +31,26 @@ DEFAULT_TOKEN_FILE = (
     / "token.json"
 )
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(\s*([^)]*?)\s*\)")
+TOKEN_REFRESH_LEEWAY_SECONDS = 60
+
+
+class HTTPError(RuntimeError):
+    """An HTTP failure whose status code can be handled by callers."""
+
+    def __init__(self, code: int, url: str, detail: str) -> None:
+        super().__init__(f"HTTP {code} {url}: {detail}")
+        self.code = code
+
+
+@dataclass
+class OAuthToken:
+    """OAuth credentials retained locally for one client and API origin."""
+
+    access_token: str
+    refresh_token: str | None
+    expires_at: float | None
+    revoke_endpoint: str | None
+    token_endpoint: str | None
 
 
 def save_token(
@@ -38,7 +59,10 @@ def save_token(
     base_url: str,
     client_id: str,
     access_token: str,
+    refresh_token: str | None,
+    expires_at: float | None,
     revoke_endpoint: str | None,
+    token_endpoint: str | None,
 ) -> None:
     """Atomically persist an OAuth token in an owner-readable-only file."""
     token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -46,7 +70,10 @@ def save_token(
         "base_url": base_url,
         "client_id": client_id,
         "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_at": expires_at,
         "revoke_endpoint": revoke_endpoint,
+        "token_endpoint": token_endpoint,
     }
     descriptor, temporary_name = tempfile.mkstemp(prefix=".token-", dir=token_file.parent)
     temporary_file = Path(temporary_name)
@@ -61,7 +88,7 @@ def save_token(
             temporary_file.unlink()
 
 
-def load_token(token_file: Path, *, base_url: str, client_id: str) -> tuple[str, str | None]:
+def load_token(token_file: Path, *, base_url: str, client_id: str) -> OAuthToken:
     """Load a token only when it belongs to the requested OAuth client."""
     if not token_file.is_file() or token_file.is_symlink():
         raise RuntimeError("Not logged in. Run with --login first.")
@@ -78,8 +105,18 @@ def load_token(token_file: Path, *, base_url: str, client_id: str) -> tuple[str,
     token = payload.get("access_token")
     if not isinstance(token, str) or not token:
         raise RuntimeError(f"Invalid token file: {token_file}")
-    revoke_endpoint = payload.get("revoke_endpoint")
-    return token, revoke_endpoint if isinstance(revoke_endpoint, str) else None
+    def optional_string(name: str) -> str | None:
+        value = payload.get(name)
+        return value if isinstance(value, str) and value else None
+
+    expires_at = payload.get("expires_at")
+    return OAuthToken(
+        access_token=token,
+        refresh_token=optional_string("refresh_token"),
+        expires_at=float(expires_at) if isinstance(expires_at, (int, float)) else None,
+        revoke_endpoint=optional_string("revoke_endpoint"),
+        token_endpoint=optional_string("token_endpoint"),
+    )
 
 
 def remove_token(token_file: Path) -> None:
@@ -118,7 +155,7 @@ def request_json(
             raw = response.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} {url}: {detail}") from exc
+        raise HTTPError(exc.code, url, detail) from exc
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -132,7 +169,84 @@ def form_body(fields: dict[str, str]) -> bytes:
     return urllib.parse.urlencode(fields).encode("utf-8")
 
 
-def upload_file(base_url: str, token: str, path: Path) -> dict[str, Any]:
+class AuthenticatedClient:
+    """Refresh and persist OAuth credentials around authenticated requests."""
+
+    def __init__(self, token_file: Path, base_url: str, client_id: str, token: OAuthToken) -> None:
+        self.token_file = token_file
+        self.base_url = base_url
+        self.client_id = client_id
+        self.token = token
+
+    def save(self) -> None:
+        save_token(
+            self.token_file,
+            base_url=self.base_url,
+            client_id=self.client_id,
+            access_token=self.token.access_token,
+            refresh_token=self.token.refresh_token,
+            expires_at=self.token.expires_at,
+            revoke_endpoint=self.token.revoke_endpoint,
+            token_endpoint=self.token.token_endpoint,
+        )
+
+    def refresh(self) -> None:
+        if not self.token.refresh_token:
+            raise RuntimeError("OAuth access token expired. Run with --login to authorize again.")
+        response = request_json(
+            self.token.token_endpoint or f"{self.base_url}/oauth/token",
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            body=form_body({
+                "grant_type": "refresh_token",
+                "client_id": self.client_id,
+                "refresh_token": self.token.refresh_token,
+            }),
+        )
+        access_token = response.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise RuntimeError("OAuth token refresh returned no access token")
+        rotated_refresh = response.get("refresh_token")
+        if rotated_refresh is not None and (not isinstance(rotated_refresh, str) or not rotated_refresh):
+            raise RuntimeError("OAuth token refresh returned an invalid refresh token")
+        expires_in = response.get("expires_in")
+        self.token.access_token = access_token
+        if isinstance(rotated_refresh, str):
+            self.token.refresh_token = rotated_refresh
+        self.token.expires_at = time.time() + float(expires_in) if isinstance(expires_in, (int, float)) else None
+        self.save()
+
+    def ensure_fresh_token(self) -> None:
+        if self.token.expires_at is not None and time.time() >= self.token.expires_at - TOKEN_REFRESH_LEEWAY_SECONDS:
+            self.refresh()
+
+    def request_json(self, url: str, **kwargs: Any) -> dict[str, Any]:
+        self.ensure_fresh_token()
+        headers = dict(kwargs.pop("headers", {}))
+        headers["Authorization"] = f"Bearer {self.token.access_token}"
+        try:
+            return request_json(url, headers=headers, **kwargs)
+        except HTTPError as exc:
+            if exc.code != 401:
+                raise
+        self.refresh()
+        retry_headers = dict(headers)
+        retry_headers["Authorization"] = f"Bearer {self.token.access_token}"
+        return request_json(url, headers=retry_headers, **kwargs)
+
+
+def authenticated_request_json(
+    auth: AuthenticatedClient | str, url: str, **kwargs: Any
+) -> dict[str, Any]:
+    """Make an authenticated request, preserving string-token helper compatibility."""
+    if isinstance(auth, AuthenticatedClient):
+        return auth.request_json(url, **kwargs)
+    headers = dict(kwargs.pop("headers", {}))
+    headers["Authorization"] = f"Bearer {auth}"
+    return request_json(url, headers=headers, **kwargs)
+
+
+def upload_file(base_url: str, auth: AuthenticatedClient | str, path: Path) -> dict[str, Any]:
     content = path.read_bytes()
     mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     boundary = "----skill2api-python-boundary"
@@ -150,11 +264,11 @@ def upload_file(base_url: str, token: str, path: Path) -> dict[str, Any]:
         content,
         f"\r\n--{boundary}--\r\n".encode(),
     ]
-    return request_json(
+    return authenticated_request_json(
+        auth,
         f"{base_url}/api/file/run/",
         method="POST",
         headers={
-            "Authorization": f"Bearer {token}",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
         },
         body=b"".join(parts),
@@ -164,17 +278,22 @@ def upload_file(base_url: str, token: str, path: Path) -> dict[str, Any]:
 
 def temporary_download_url(
     base_url: str,
-    token: str,
+    auth: AuthenticatedClient | str,
     request_id: str,
     path: str,
+    *,
+    poll_seconds: int = 5,
+    poll_timeout: int = 1800,
 ) -> str:
-    """Request a worker-uploaded temporary download URL.
+    """Queue and await a worker-uploaded temporary download URL.
 
     Args:
         base_url: Myna HTTP API origin.
         token: OAuth access token for the owning Skill2API request.
         request_id: Generated Skill2API request identifier.
         path: Worker-approved relative output path.
+        poll_seconds: Delay between delivery status requests.
+        poll_timeout: Maximum time to wait for delivery completion.
 
     Returns:
         Relative temporary upload URL returned by the Skill2API file endpoint.
@@ -182,11 +301,39 @@ def temporary_download_url(
     Raises:
         RuntimeError: If the worker response has no safe temporary upload URL.
     """
-    query = urllib.parse.urlencode({"request_id": request_id, "file_path": path})
-    payload = request_json(
-        f"{base_url}/api/skill2api/file/?{query}",
-        headers={"Authorization": f"Bearer {token}"},
+    submitted = authenticated_request_json(
+        auth,
+        f"{base_url}/api/skill2api/file/",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        body=json.dumps({"request_id": request_id, "file_path": path}).encode(),
     )
+    delivery_id = submitted.get("delivery_id")
+    if not isinstance(delivery_id, str) or not delivery_id:
+        raise RuntimeError(f"Invalid temporary delivery submission for {path}")
+
+    deadline = time.monotonic() + poll_timeout
+    while True:
+        query = urllib.parse.urlencode(
+            {"request_id": request_id, "delivery_id": delivery_id}
+        )
+        payload = authenticated_request_json(
+            auth,
+            f"{base_url}/api/skill2api/file/delivery/?{query}",
+        )
+        state = payload.get("status")
+        if state == "failed":
+            error = payload.get("error")
+            detail = error if isinstance(error, str) and error else "unknown error"
+            raise RuntimeError(f"Temporary delivery failed for {path}: {detail}")
+        if state == "succeeded":
+            break
+        if state not in {"queued", "running"}:
+            raise RuntimeError(f"Invalid temporary delivery status for {path}: {state!r}")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Temporary delivery timed out for {path}")
+        time.sleep(poll_seconds)
+
     url = payload.get("url")
     parsed = urllib.parse.urlsplit(url if isinstance(url, str) else "")
     if parsed.scheme or parsed.netloc or not parsed.path.startswith("/upload/"):
@@ -242,7 +389,7 @@ def choose_answer(question: Any, options: Any) -> str:
 
 def resume_request(
     base_url: str,
-    token: str,
+    auth: AuthenticatedClient | str,
     request_id: str,
     *,
     answer: str | None = None,
@@ -256,48 +403,50 @@ def resume_request(
         payload["answer"] = answer
     else:
         payload["instruction"] = instruction or ""
-    return request_json(
+    return authenticated_request_json(
+        auth,
         f"{base_url}/api/skill2api/resume/",
         method="POST",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={"Content-Type": "application/json"},
         body=json.dumps(payload).encode(),
     )
 
 
-def terminate_request(base_url: str, token: str, request_id: str) -> dict[str, Any]:
+def terminate_request(base_url: str, auth: AuthenticatedClient | str, request_id: str) -> dict[str, Any]:
     """Terminate one existing Skill2API request."""
-    return request_json(
+    return authenticated_request_json(
+        auth,
         f"{base_url}/api/skill2api/terminate/",
         method="POST",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={"Content-Type": "application/json"},
         body=json.dumps({"request_id": request_id}).encode(),
     )
 
 
-def get_status(base_url: str, token: str, request_id: str) -> dict[str, Any]:
+def get_status(base_url: str, auth: AuthenticatedClient | str, request_id: str) -> dict[str, Any]:
     """Fetch the public status for one Skill2API request."""
     query = urllib.parse.urlencode({"request_id": request_id})
-    return request_json(
+    return authenticated_request_json(
+        auth,
         f"{base_url}/api/skill2api/status/?{query}",
-        headers={"Authorization": f"Bearer {token}"},
     )
 
 
 def answer_pending_request(
     base_url: str,
-    token: str,
+    auth: AuthenticatedClient | str,
     request_id: str,
     status: dict[str, Any],
 ) -> None:
     """Interactively answer one pending Skill2API clarification."""
     answer = choose_answer(status.get("question"), status.get("options"))
-    resumed = resume_request(base_url, token, request_id, answer=answer)
+    resumed = resume_request(base_url, auth, request_id, answer=answer)
     print(f"resume status={resumed.get('status')}")
 
 
 def poll_until_terminal(
     base_url: str,
-    token: str,
+    auth: AuthenticatedClient | str,
     request_id: str,
     *,
     poll_seconds: int,
@@ -307,11 +456,11 @@ def poll_until_terminal(
     deadline = time.monotonic() + poll_timeout
     terminal = {"succeeded", "failed", "terminated"}
     while True:
-        status = get_status(base_url, token, request_id)
+        status = get_status(base_url, auth, request_id)
         state = status.get("status")
         print(f"status={state}")
         if state == "waiting_for_input":
-            answer_pending_request(base_url, token, request_id, status)
+            answer_pending_request(base_url, auth, request_id, status)
             time.sleep(poll_seconds)
             continue
         if state in terminal:
@@ -405,7 +554,7 @@ def parse_arguments() -> argparse.Namespace:
     return args
 
 
-def poll_device_token(device: dict[str, Any], token_endpoint: str, client_id: str) -> str:
+def poll_device_token(device: dict[str, Any], token_endpoint: str, client_id: str) -> dict[str, Any]:
     """Wait for the browser-approved OAuth device grant."""
     deadline = time.monotonic() + int(device.get("expires_in", 600))
     interval = max(3, int(device.get("interval", 3)))
@@ -432,13 +581,14 @@ def poll_device_token(device: dict[str, Any], token_endpoint: str, client_id: st
             continue
         if response.get("error"):
             raise RuntimeError(f"OAuth failed: {response['error']}")
-        token = str(response["access_token"])
+        if not isinstance(response.get("access_token"), str) or not response["access_token"]:
+            raise RuntimeError("OAuth response returned no access token")
         print(f"OAuth authorized; scope={response.get('scope', '')}")
-        return token
+        return response
     raise RuntimeError("OAuth authorization timed out")
 
 
-def authorize_device(base_url: str, client_id: str) -> tuple[str, str | None]:
+def authorize_device(base_url: str, client_id: str) -> OAuthToken:
     """Start browser device authorization and return its access token."""
     metadata = request_json(f"{base_url}/.well-known/oauth-authorization-server")
     device = request_json(
@@ -452,9 +602,15 @@ def authorize_device(base_url: str, client_id: str) -> tuple[str, str | None]:
     verification_url = device.get("verification_uri_complete") or device["verification_uri"]
     print(f"Open and approve OAuth authorization:\n{verification_url}")
     webbrowser.open(verification_url)
-    token = poll_device_token(device, metadata["token_endpoint"], client_id)
-    revoke_endpoint = metadata.get("revocation_endpoint")
-    return token, revoke_endpoint if isinstance(revoke_endpoint, str) else None
+    response = poll_device_token(device, metadata["token_endpoint"], client_id)
+    expires_in = response.get("expires_in")
+    return OAuthToken(
+        access_token=response["access_token"],
+        refresh_token=response.get("refresh_token") if isinstance(response.get("refresh_token"), str) else None,
+        expires_at=time.time() + float(expires_in) if isinstance(expires_in, (int, float)) else None,
+        revoke_endpoint=metadata.get("revocation_endpoint") if isinstance(metadata.get("revocation_endpoint"), str) else None,
+        token_endpoint=metadata["token_endpoint"],
+    )
 
 
 def uploaded_file_url(base_url: str, upload: dict[str, Any]) -> str:
@@ -466,10 +622,10 @@ def uploaded_file_url(base_url: str, upload: dict[str, Any]) -> str:
     return f"{base_url}/upload/{shard}/{file_key}.{file_ext}"
 
 
-def upload_source_media(base_url: str, token: str, image: Path, video: Path) -> tuple[str, str]:
+def upload_source_media(base_url: str, auth: AuthenticatedClient | str, image: Path, video: Path) -> tuple[str, str]:
     """Upload image and video sources, returning their temporary provider URLs."""
-    image_upload = upload_file(base_url, token, image)
-    video_upload = upload_file(base_url, token, video)
+    image_upload = upload_file(base_url, auth, image)
+    video_upload = upload_file(base_url, auth, video)
     image_url = uploaded_file_url(base_url, image_upload)
     video_url = uploaded_file_url(base_url, video_upload)
     print(f"Uploaded temporary image id={image_upload['file'].get('id')} {image_url}")
@@ -482,6 +638,8 @@ def build_hypit_prompt(video_url: str, image_url: str) -> str:
     return f"""
 $hypit 克隆视频 {video_url} 替换商品为 {image_url} 替换人物为 公开的虚拟人像: asset://asset-20260720205609-dvhxr
 
+视频里面有人脸，你不能通过编辑的方式制作视频
+
 尺寸 480p  9:16
 
 预算 2 美金
@@ -489,12 +647,13 @@ $hypit 克隆视频 {video_url} 替换商品为 {image_url} 替换人物为 公�
 """
 
 
-def submit_generation(base_url: str, token: str, prompt: str, model: str) -> str:
+def submit_generation(base_url: str, auth: AuthenticatedClient | str, prompt: str, model: str) -> str:
     """Create the Hypit Skill2API request and return its server-generated ID."""
-    generated = request_json(
+    generated = authenticated_request_json(
+        auth,
         f"{base_url}/api/skill2api/generate/",
         method="POST",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={"Content-Type": "application/json"},
         body=json.dumps({"prompt": prompt, "skill_name": "hypit", "model": model}).encode(),
     )
     request_id = str(generated["request_id"])
@@ -544,10 +703,13 @@ def final_mp4_from_status(status: dict[str, Any]) -> str | None:
 
 def download_results(
     base_url: str,
-    token: str,
+    auth: AuthenticatedClient | str,
     request_id: str,
     status: dict[str, Any],
     output: Path,
+    *,
+    poll_seconds: int,
+    poll_timeout: int,
 ) -> None:
     """Download the final MP4 reported by the successful status response."""
     output.mkdir(parents=True, exist_ok=True)
@@ -558,7 +720,14 @@ def download_results(
     print(final_mp4)
     destination = output / final_mp4
     destination.parent.mkdir(parents=True, exist_ok=True)
-    url = temporary_download_url(base_url, token, request_id, final_mp4)
+    url = temporary_download_url(
+        base_url,
+        auth,
+        request_id,
+        final_mp4,
+        poll_seconds=poll_seconds,
+        poll_timeout=poll_timeout,
+    )
     print(url)
     download_file(base_url, url, destination)
     print(f"Succeeded; downloaded final MP4 to {destination}")
@@ -584,47 +753,63 @@ def main() -> int:
 
     base_url = args.base_url.rstrip("/")
     if args.login:
-        token, revoke_endpoint = authorize_device(base_url, args.client_id)
+        token = authorize_device(base_url, args.client_id)
         save_token(
             args.token_file,
             base_url=base_url,
             client_id=args.client_id,
-            access_token=token,
-            revoke_endpoint=revoke_endpoint,
+            access_token=token.access_token,
+            refresh_token=token.refresh_token,
+            expires_at=token.expires_at,
+            revoke_endpoint=token.revoke_endpoint,
+            token_endpoint=token.token_endpoint,
         )
         print(f"Login saved to {args.token_file}")
         return 0
     if args.logout:
-        token, revoke_endpoint = load_token(
+        token = load_token(
             args.token_file, base_url=base_url, client_id=args.client_id
         )
         try:
-            revoke_token(base_url, revoke_endpoint, args.client_id, token)
+            revoke_token(base_url, token.revoke_endpoint, args.client_id, token.refresh_token or token.access_token)
         finally:
             remove_token(args.token_file)
         print("Logged out")
         return 0
 
-    token, _ = load_token(args.token_file, base_url=base_url, client_id=args.client_id)
+    auth = AuthenticatedClient(
+        args.token_file,
+        base_url,
+        args.client_id,
+        load_token(args.token_file, base_url=base_url, client_id=args.client_id),
+    )
     if args.download_video:
         request_id = args.download_video
-        status = get_status(base_url, token, request_id)
+        status = get_status(base_url, auth, request_id)
         if status.get("status") != "succeeded":
             raise RuntimeError(
                 "Skill2API request is not ready to download: "
                 f"{status.get('error', status.get('status'))}"
             )
-        download_results(base_url, token, request_id, status, args.output)
+        download_results(
+            base_url,
+            auth,
+            request_id,
+            status,
+            args.output,
+            poll_seconds=args.poll_seconds,
+            poll_timeout=args.poll_timeout,
+        )
         return 0
     if args.request_id:
         request_id = args.request_id
         if args.terminate:
-            terminated = terminate_request(base_url, token, request_id)
+            terminated = terminate_request(base_url, auth, request_id)
             print(f"terminate status={terminated.get('status')}")
             return 0
         resumed = resume_request(
             base_url,
-            token,
+            auth,
             request_id,
             answer=args.answer,
             instruction=args.append_prompt,
@@ -635,13 +820,13 @@ def main() -> int:
             )
         print(f"Resumed request_id={request_id}")
     else:
-        image_url, video_url = upload_source_media(base_url, token, args.image, args.video)
+        image_url, video_url = upload_source_media(base_url, auth, args.image, args.video)
         prompt = build_hypit_prompt(video_url, image_url)
         print(prompt)
-        request_id = submit_generation(base_url, token, prompt, args.model)
+        request_id = submit_generation(base_url, auth, prompt, args.model)
     status = poll_until_terminal(
         base_url,
-        token,
+        auth,
         request_id,
         poll_seconds=args.poll_seconds,
         poll_timeout=args.poll_timeout,
@@ -649,7 +834,15 @@ def main() -> int:
 
     if status.get("status") != "succeeded":
         raise RuntimeError(f"Skill2API failed: {status.get('error', 'unknown error')}")
-    download_results(base_url, token, request_id, status, args.output)
+    download_results(
+        base_url,
+        auth,
+        request_id,
+        status,
+        args.output,
+        poll_seconds=args.poll_seconds,
+        poll_timeout=args.poll_timeout,
+    )
     return 0
 
 
