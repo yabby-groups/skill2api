@@ -1153,6 +1153,32 @@ func TestRunCodexRedactsPromptAndResumeAnswerFromLogs(t *testing.T) {
 	}
 }
 
+func TestRunCodexDebugPreservesSensitiveLogs(t *testing.T) {
+	c, root := testConfig(t)
+	c.Debug = true
+	c.MaxOutput = 4096
+	bin := filepath.Join(root, "fake-codex")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf 'secret prompt value\\n' >&2\nprintf 'session id: private-session-1\\n' >&2\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c.CodexBin = bin
+	out := filepath.Join(root, "request-1")
+	if err := os.MkdirAll(out, 0750); err != nil {
+		t.Fatal(err)
+	}
+	_, stderr, sessionID, err := runCodexWithSession(context.Background(), c, generateRequest{OutputDir: out, Prompt: "secret prompt value"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sessionID != "private-session-1" || !strings.Contains(stderr, "secret prompt value") || !strings.Contains(stderr, "private-session-1") {
+		t.Fatalf("debug output did not preserve sensitive data: session=%q stderr=%q", sessionID, stderr)
+	}
+	logData, err := os.ReadFile(filepath.Join(out, stderrLogName))
+	if err != nil || !strings.Contains(string(logData), "private-session-1") {
+		t.Fatalf("debug stderr log missing session ID: %q err=%v", logData, err)
+	}
+}
+
 func TestRunCodexPassesEnvironmentAndModelWithoutLeakingValue(t *testing.T) {
 	c, root := testConfig(t)
 	bin := filepath.Join(root, "fake-codex")
@@ -1243,11 +1269,29 @@ func TestConfigPlainModeUsesPeriodicSettings(t *testing.T) {
 	if c.Timeout != 6*time.Hour {
 		t.Fatalf("default Codex timeout = %s, want %s", c.Timeout, 6*time.Hour)
 	}
-	if c.CodexNoProxy || c.CodexDocker || c.CodexDockerBin != "docker" || c.CodexDockerImage != "lupino/sandbox-runner:latest" {
+	if c.CodexNoProxy || c.CodexDocker || c.Debug || c.CodexDockerBin != "docker" || c.CodexDockerImage != "lupino/sandbox-runner:latest" {
 		t.Fatalf("direct provider settings should default to false: %#v", c)
 	}
 	if withPrefix(c.TaskPrefix, generateFunc) != "generation-skill2api_generate" || statusFunc != "skill2api_status" || cleanupFunc != "skill2api_cleanup" {
 		t.Fatal("periodic function naming contract changed")
+	}
+}
+
+func TestConfigDebugOverride(t *testing.T) {
+	t.Setenv("PERIODIC_PORT", "tcp://periodic:5000")
+	t.Setenv("PERIODIC_RSA_MODE", "0")
+	t.Setenv("SKILL2API_OUTPUT_ROOT", t.TempDir())
+	t.Setenv("SKILL2API_DEBUG", "true")
+	c, err := newConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Debug {
+		t.Fatal("debug setting was not enabled")
+	}
+	t.Setenv("SKILL2API_DEBUG", "invalid")
+	if _, err := newConfig(); err == nil || !strings.Contains(err.Error(), "SKILL2API_DEBUG") {
+		t.Fatalf("invalid debug setting error = %v", err)
 	}
 }
 

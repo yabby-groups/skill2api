@@ -79,6 +79,13 @@ Caller-provided prompts and resume answers are redacted before either log is
 written. Codex session IDs are also redacted from public logs and status
 responses; the worker retains the ID privately for resume.
 
+For controlled troubleshooting, set `SKILL2API_DEBUG=true` before starting the
+worker. Debug mode preserves caller prompts, resume answers, environment values,
+and Codex session IDs in the worker-managed stdout/stderr logs and in the log
+tails returned by `skill2api_status`. The `session_id` field itself remains
+hidden from public status responses. Debug mode is read only at startup and
+should be used only where these logs are access-controlled.
+
 ## Get a Generated File
 
 Read one existing file from a task directory with its relative path. The task
@@ -204,6 +211,10 @@ Neither source is persisted or returned.
 execution resumed after an interactive prompt. It defaults to 21600 seconds
 (6 hours), which accommodates long-running video-generation skills. Set it to
 a larger positive number when a deployment needs a longer limit.
+
+Set `SKILL2API_DEBUG=true` to disable privacy redaction in worker-managed Codex
+logs and status log tails. It is read when the worker starts and defaults to
+`false`.
 
 ## Direct Provider Network
 

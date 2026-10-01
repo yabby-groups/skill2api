@@ -200,6 +200,7 @@ type config struct {
 	CodexDockerImage  string
 	CodexDockerOptDir string
 	CodexNoProxy      bool
+	Debug             bool
 	UploadBaseURL     string
 	Timeout           time.Duration
 	MaxOutput         int
@@ -284,6 +285,10 @@ func newConfig() (config, error) {
 	if err != nil {
 		return config{}, errors.New("SKILL2API_CODEX_DOCKER must be true or false")
 	}
+	debug, err := strconv.ParseBool(firstEnvDefault("SKILL2API_DEBUG", "false"))
+	if err != nil {
+		return config{}, errors.New("SKILL2API_DEBUG must be true or false")
+	}
 	optDir := strings.TrimSpace(os.Getenv("SKILL2API_CODEX_DOCKER_OPT_DIR"))
 	if dockerEnabled && optDir != "" {
 		optDir, err = filepath.Abs(optDir)
@@ -303,7 +308,7 @@ func newConfig() (config, error) {
 	if err != nil || uploadURL.Scheme == "" || uploadURL.Host == "" {
 		return config{}, errors.New("SKILL2API_UPLOAD_BASE_URL must be an absolute URL")
 	}
-	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexDockerOptDir: optDir, CodexNoProxy: noProxy, UploadBaseURL: uploadBaseURL, Timeout: timeout, MaxOutput: limit, MaxFileBytes: fileLimit}, nil
+	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexDockerOptDir: optDir, CodexNoProxy: noProxy, Debug: debug, UploadBaseURL: uploadBaseURL, Timeout: timeout, MaxOutput: limit, MaxFileBytes: fileLimit}, nil
 }
 func firstEnvDefault(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -1065,6 +1070,9 @@ func runCodexCommandSkills(ctx context.Context, c config, requestID, outputDir s
 	if err != nil {
 		return "", "", "", err
 	}
+	if c.Debug {
+		redactions = nil
+	}
 	if !appendLogs {
 		stdoutOffset, stderrOffset = 0, 0
 	}
@@ -1079,8 +1087,8 @@ func runCodexCommandSkills(ctx context.Context, c config, requestID, outputDir s
 		return "", "", "", err
 	}
 	log.Printf("event=skill2api_codex_start output_dir=%s codex_bin=%s timeout=%s", outputDir, executable, c.Timeout)
-	stdoutWriter := &redactingLogWriter{file: stdoutLog, redactions: redactions}
-	stderrWriter := &redactingLogWriter{file: stderrLog, redactions: redactions, onSessionID: onSessionID}
+	stdoutWriter := &redactingLogWriter{file: stdoutLog, redactions: redactions, redact: !c.Debug}
+	stderrWriter := &redactingLogWriter{file: stderrLog, redactions: redactions, redact: !c.Debug, onSessionID: onSessionID}
 	cmd.Stdout, cmd.Stderr = stdoutWriter, stderrWriter
 	err = cmd.Run()
 	closeErr := closeOutputLogs(stdoutWriter, stderrWriter)
@@ -1342,6 +1350,7 @@ func openOutputLogs(outputDir string, appendLogs bool) (*os.File, *os.File, erro
 type redactingLogWriter struct {
 	file        *os.File
 	redactions  []string
+	redact      bool
 	pending     []byte
 	sessionID   string
 	onSessionID func(string)
@@ -1381,10 +1390,12 @@ func (w *redactingLogWriter) writeLine(line []byte) error {
 			w.onSessionID(sessionID)
 		}
 	}
-	for _, redaction := range w.redactions {
-		text = strings.ReplaceAll(text, redaction, "[redacted]")
+	if w.redact {
+		for _, redaction := range w.redactions {
+			text = strings.ReplaceAll(text, redaction, "[redacted]")
+		}
+		text = redactSessionID(text)
 	}
-	text = redactSessionID(text)
 	_, err := w.file.WriteString(text)
 	return err
 }

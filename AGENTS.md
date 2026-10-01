@@ -46,6 +46,7 @@ Optional settings include:
 - `SKILL2API_CODEX_DOCKER_OPT_DIR` (optional host directory mounted read-only at container `/opt` in Docker mode; `/opt/bin` is added to `PATH`)
 - `SKILL2API_CODEX_TIMEOUT_SECONDS` (defaults to 21600 / 6 hours)
 - `SKILL2API_MAX_OUTPUT_BYTES` (defaults to 65536)
+- `SKILL2API_DEBUG` (defaults to `false`; startup-only debug logging with private data)
 - `TASK_PREFIX`
 - `PERIODIC_RSA_MODE`
 - `PERIODIC_RSA_PRIVATE_KEY_PATH`
@@ -105,9 +106,12 @@ session ID is stored privately and is never returned by `skill2api_status`.
 - Codex is invoked as `codex exec --sandbox workspace-write --cd <output-dir>
   --skip-git-repo-check ...`; do not reintroduce obsolete flags such as
   `--full-auto`.
-- Keep prompts and answers out of logs. Log lifecycle events and useful error
-  context without leaking secrets.
+- Keep prompts and answers out of logs by default. Log lifecycle events and
+  useful error context without leaking secrets.
 - Keep public status responses free of `session_id`.
+- When `SKILL2API_DEBUG=true`, worker-managed Codex logs and status log tails
+  intentionally include private data; keep this mode limited to controlled
+  environments. The public status schema still omits `session_id`.
 
 ## End-to-End Verification
 
