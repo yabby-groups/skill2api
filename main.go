@@ -1535,6 +1535,16 @@ func listFiles(dir string) ([]string, error) {
 	return files, err
 }
 
+// captureExistingFiles preserves artifacts produced before an interrupted run.
+func captureExistingFiles(v *taskStatus) {
+	files, err := listFiles(v.OutputDir)
+	if err != nil {
+		log.Printf("event=skill2api_files request_id=%s result=list_failed error=%q", v.RequestID, err)
+		return
+	}
+	v.Files = files
+}
+
 func readTaskFile(outputDir, rawPath string, maxBytes int) ([]byte, error) {
 	filePath := strings.TrimSpace(rawPath)
 	if filePath == "" || filepath.IsAbs(filePath) {
@@ -1805,6 +1815,7 @@ func execute(store *statusStore, manager *taskManager, c config, req generateReq
 		if interruptedDockerExecution(c, v.SessionID, stderr) {
 			v.Status = "interrupted"
 			v.Error = "Docker execution interrupted before token usage was recorded"
+			captureExistingFiles(&v)
 		} else {
 			v.Status = "failed"
 			v.Error = err.Error()
@@ -1858,6 +1869,7 @@ func execute(store *statusStore, manager *taskManager, c config, req generateReq
 	if interruptedDockerExecution(c, v.SessionID, stderr) {
 		v.Status = "interrupted"
 		v.Error = "Docker execution ended without token usage summary"
+		captureExistingFiles(&v)
 		v.FinishedAt = ""
 		_, _ = store.writeFromRunning(v)
 		log.Printf("event=skill2api_state request_id=%s status=interrupted reason=missing_token_usage", req.RequestID)
@@ -1910,6 +1922,7 @@ func executeResume(store *statusStore, manager *taskManager, c config, req resum
 			v.Status, v.Error = "interrupted", "Docker execution ended without token usage summary"
 		}
 		if v.Status == "interrupted" {
+			captureExistingFiles(&v)
 			v.FinishedAt = ""
 			_, _ = store.writeFromRunning(v)
 			return

@@ -387,6 +387,12 @@ func TestDockerExecutionWithoutTokenUsageIsInterrupted(t *testing.T) {
 	}
 	c.CodexDocker, c.CodexDockerBin = true, fakeDocker
 	req := generateRequest{RequestID: "request-1", SkillName: "demo", OutputDir: filepath.Join(root, "request-1"), Prompt: "Create the requested video."}
+	if err := os.MkdirAll(req.OutputDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(req.OutputDir, "final.mp4"), []byte("video"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	store := &statusStore{root: root}
 	if err := store.create(taskStatus{RequestID: req.RequestID, Status: "queued", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), SkillName: req.SkillName, OutputDir: req.OutputDir}, false); err != nil {
 		t.Fatal(err)
@@ -398,6 +404,40 @@ func TestDockerExecutionWithoutTokenUsageIsInterrupted(t *testing.T) {
 	}
 	if got.Status != "interrupted" || got.FinishedAt != "" {
 		t.Fatalf("Docker execution status = %#v", got)
+	}
+	if !containsFile(got.Files, "final.mp4") {
+		t.Fatalf("Docker execution files = %#v, want final.mp4", got.Files)
+	}
+}
+
+func TestDockerExecutionFailureWithoutTokenUsagePreservesFiles(t *testing.T) {
+	c, root := testConfig(t)
+	fakeDocker := filepath.Join(root, "fake-docker")
+	if err := os.WriteFile(fakeDocker, []byte("#!/bin/sh\nprintf 'session id: docker-session-1\\n' >&2\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c.CodexDocker, c.CodexDockerBin = true, fakeDocker
+	req := generateRequest{RequestID: "request-1", SkillName: "demo", OutputDir: filepath.Join(root, "request-1"), Prompt: "Create the requested video."}
+	if err := os.MkdirAll(req.OutputDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(req.OutputDir, "final.mp4"), []byte("video"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store := &statusStore{root: root}
+	if err := store.create(taskStatus{RequestID: req.RequestID, Status: "queued", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), SkillName: req.SkillName, OutputDir: req.OutputDir}, false); err != nil {
+		t.Fatal(err)
+	}
+	execute(store, newTaskManager(), c, req)
+	got, err := store.read(req.RequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "interrupted" || got.FinishedAt != "" {
+		t.Fatalf("Docker execution failure status = %#v", got)
+	}
+	if !containsFile(got.Files, "final.mp4") {
+		t.Fatalf("Docker execution failure files = %#v, want final.mp4", got.Files)
 	}
 }
 
@@ -463,6 +503,9 @@ func TestDockerResumeIgnoresPriorInputMarkerWhenNewRunIsSilent(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(outputDir, stdoutLogName), []byte("SKILL2API_INPUT_REQUIRED\n{\"question\":\"Previous question\"}\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(outputDir, "final.mp4"), []byte("video"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	store := &statusStore{root: root}
 	v := taskStatus{RequestID: "request-1", Status: "running", StartedAt: time.Now().UTC().Format(time.RFC3339Nano), SkillName: "demo", OutputDir: outputDir, SessionID: "docker-session-1"}
 	if err := store.write(v); err != nil {
@@ -476,6 +519,18 @@ func TestDockerResumeIgnoresPriorInputMarkerWhenNewRunIsSilent(t *testing.T) {
 	if got.Status != "interrupted" || got.Question != "" || got.FinishedAt != "" {
 		t.Fatalf("silent Docker resume status = %#v", got)
 	}
+	if !containsFile(got.Files, "final.mp4") {
+		t.Fatalf("silent Docker resume files = %#v, want final.mp4", got.Files)
+	}
+}
+
+func containsFile(files []string, want string) bool {
+	for _, file := range files {
+		if file == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCodexPromptPreservesCallerPromptAndSkillVerbatim(t *testing.T) {
