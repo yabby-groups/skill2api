@@ -892,6 +892,63 @@ func TestCleanupRemovesOnlyNamedExpiredDedicatedTaskDataAndSessions(t *testing.T
 	}
 }
 
+func TestRemoveTaskDataKeepsStatusForRetryWhenArtifactRemovalFails(t *testing.T) {
+	taskDir := t.TempDir()
+	statusPath := filepath.Join(taskDir, "status.json")
+	artifactPath := filepath.Join(taskDir, "artifact.txt")
+	if err := os.WriteFile(statusPath, []byte(`{"request_id":"request-1"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(artifactPath, []byte("artifact"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("busy artifact")
+	err := removeTaskData(taskDir, statusPath, func(path string) error {
+		if path == artifactPath {
+			return wantErr
+		}
+		return os.RemoveAll(path)
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("removeTaskData error = %v, want %v", err, wantErr)
+	}
+	if _, err := os.Stat(statusPath); err != nil {
+		t.Fatalf("status file was removed after failed cleanup: %v", err)
+	}
+}
+
+func TestCleanupRescheduleDelayUsesRetentionDeadline(t *testing.T) {
+	now := time.Date(2026, time.October, 8, 12, 0, 0, 0, time.UTC)
+	if delay, ok := cleanupRescheduleDelay(cleanupResponse{Status: "deferred"}, now); !ok || delay != int(retentionAge.Seconds()) {
+		t.Fatalf("deferred cleanup delay = %d, %t", delay, ok)
+	}
+	dueAt := now.Add(90*time.Minute + 500*time.Millisecond)
+	if delay, ok := cleanupRescheduleDelay(cleanupResponse{Status: "not_due", retryAt: dueAt}, now); !ok || delay != 5401 {
+		t.Fatalf("not-due cleanup delay = %d, %t", delay, ok)
+	}
+	if _, ok := cleanupRescheduleDelay(cleanupResponse{Status: "not_due"}, now); ok {
+		t.Fatal("cleanup without a due time should not be rescheduled")
+	}
+}
+
+func TestCleanupUsesFinishedAtForRetentionDeadline(t *testing.T) {
+	c, root := testConfig(t)
+	store := &statusStore{root: root}
+	now := time.Date(2026, time.October, 8, 12, 0, 0, 0, time.UTC)
+	finishedAt := now.Add(-time.Hour)
+	outputDir := filepath.Join(root, "recent")
+	if err := os.MkdirAll(outputDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.write(taskStatus{RequestID: "recent", Status: "succeeded", FinishedAt: finishedAt.Format(time.RFC3339Nano), OutputDir: outputDir}); err != nil {
+		t.Fatal(err)
+	}
+	got := store.cleanup(c, "recent", now)
+	if got.Status != "not_due" || !got.retryAt.Equal(finishedAt.Add(retentionAge)) {
+		t.Fatalf("cleanup result = %#v, want not_due at %s", got, finishedAt.Add(retentionAge))
+	}
+}
+
 func TestSubmitCleanupAtUsesRequestIDAndTerminalRetention(t *testing.T) {
 	c, _ := testConfig(t)
 	c.TaskPrefix = "generation-"

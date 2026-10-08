@@ -129,6 +129,7 @@ type cleanupResponse struct {
 	RequestID string `json:"request_id"`
 	Status    string `json:"status"`
 	Error     string `json:"error,omitempty"`
+	retryAt   time.Time
 }
 
 type taskStatus struct {
@@ -668,6 +669,28 @@ func scheduleCleanup(c config, requestID string) {
 	log.Printf("event=skill2api_cleanup request_id=%s result=scheduled", requestID)
 }
 
+// removeTaskData keeps statusPath until every other task artifact is gone, so a
+// failed cleanup can be retried with the same request ID.
+func removeTaskData(taskDir, statusPath string, removeAll func(string) error) error {
+	entries, err := os.ReadDir(taskDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		path := filepath.Join(taskDir, entry.Name())
+		if filepath.Clean(path) == filepath.Clean(statusPath) {
+			continue
+		}
+		if err := removeAll(path); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(statusPath); err != nil {
+		return err
+	}
+	return os.Remove(taskDir)
+}
+
 func (s *statusStore) cleanup(c config, id string, now time.Time) cleanupResponse {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -693,6 +716,7 @@ func (s *statusStore) cleanup(c config, id string, now time.Time) cleanupRespons
 	}
 	if finishedAt.Add(retentionAge).After(now) {
 		result.Status, result.Error = "not_due", "retention period has not elapsed"
+		result.retryAt = finishedAt.Add(retentionAge)
 		return result
 	}
 	if filepath.Clean(v.OutputDir) != filepath.Join(s.root, id) {
@@ -704,7 +728,7 @@ func (s *statusStore) cleanup(c config, id string, now time.Time) cleanupRespons
 		result.Status, result.Error = "failed", "remove private Codex session"
 		return result
 	}
-	if err := os.RemoveAll(filepath.Join(s.root, id)); err != nil {
+	if err := removeTaskData(filepath.Join(s.root, id), s.path(id), os.RemoveAll); err != nil {
 		log.Printf("event=skill2api_cleanup request_id=%s result=data_remove_failed error=%q", id, err)
 		result.Status, result.Error = "failed", "remove task data"
 		return result
@@ -712,6 +736,20 @@ func (s *statusStore) cleanup(c config, id string, now time.Time) cleanupRespons
 	log.Printf("event=skill2api_cleanup request_id=%s result=deleted", id)
 	result.Status = "deleted"
 	return result
+}
+
+func cleanupRescheduleDelay(result cleanupResponse, now time.Time) (int, bool) {
+	if result.Status == "deferred" {
+		return int(retentionAge.Seconds()), true
+	}
+	if result.Status != "not_due" || result.retryAt.IsZero() {
+		return 0, false
+	}
+	delay := result.retryAt.Sub(now)
+	if delay <= 0 {
+		return 1, true
+	}
+	return int((delay + time.Second - 1) / time.Second), true
 }
 
 func validateRequest(req generateRequest, c config) error {
@@ -2336,10 +2374,11 @@ func handleCleanup(job periodic.Job, store *statusStore, c config) {
 		_ = job.Fail()
 		return
 	}
-	result := store.cleanup(c, req.RequestID, time.Now().UTC())
-	if result.Status == "deferred" {
-		if err := job.SchedLater(int(retentionAge.Seconds())); err != nil {
-			log.Printf("event=skill2api_cleanup request_id=%s result=defer_failed error=%q", req.RequestID, err)
+	now := time.Now().UTC()
+	result := store.cleanup(c, req.RequestID, now)
+	if delay, reschedule := cleanupRescheduleDelay(result, now); reschedule {
+		if err := job.SchedLater(delay); err != nil {
+			log.Printf("event=skill2api_cleanup request_id=%s result=reschedule_failed error=%q", req.RequestID, err)
 			_ = job.Fail()
 		}
 		return
