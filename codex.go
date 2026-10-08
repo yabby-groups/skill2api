@@ -118,7 +118,7 @@ func codexPromptSkills(prompt string, skills [][]byte, names []string, docker bo
 	if docker {
 		out.WriteString("\n\nSelected skill packages are mounted read-only. Resolve package-relative resources using:\n")
 		for _, name := range names {
-			fmt.Fprintf(&out, "- %s: /workspace/skills/%s\n", name, name)
+			fmt.Fprintf(&out, "- %s: %s\n", name, dockerSkillDir(name))
 		}
 	}
 	return out.String()
@@ -152,7 +152,7 @@ func runCodexResume(ctx context.Context, c config, req taskStatus, answer, instr
 		}
 		prompt += "\n\nSelected skill packages remain mounted read-only:\n"
 		for _, name := range names {
-			prompt += fmt.Sprintf("- %s: /workspace/skills/%s\n", name, name)
+			prompt += fmt.Sprintf("- %s: %s\n", name, dockerSkillDir(name))
 		}
 	}
 	environment = codexRequestEnvironment(c, environment)
@@ -309,6 +309,10 @@ func dockerContainerName(requestID string) string {
 	return "skill2api-" + requestID
 }
 
+func dockerSkillDir(name string) string {
+	return dockerSkillsDir + "/" + name
+}
+
 func newCodexCommand(ctx context.Context, c config, requestID, outputDir string, environment map[string]string, args []string) (*exec.Cmd, string, error) {
 	return newCodexCommandSkills(ctx, c, requestID, outputDir, nil, environment, args)
 }
@@ -347,7 +351,9 @@ func newCodexCommandSkills(ctx context.Context, c config, requestID, outputDir s
 		if err != nil {
 			return nil, c.CodexDockerBin, err
 		}
-		dockerArgs = append(dockerArgs, "--mount", "type=bind,src="+dir+",dst=/workspace/skills/"+name+",readonly")
+		// Keep Docker-created mount targets outside the task output bind mount.
+		// Docker otherwise creates /workspace/skills as root on the host.
+		dockerArgs = append(dockerArgs, "--mount", "type=bind,src="+dir+",dst="+dockerSkillDir(name)+",readonly")
 	}
 	dockerEnv := dockerEnvironment(c, environment)
 	if c.CodexDockerOptDir != "" {

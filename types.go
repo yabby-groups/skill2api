@@ -28,6 +28,7 @@ const (
 	maxInputTailBytes      = 16 * 1024
 	fileUploadTimeout      = 45 * time.Second
 	fileUploadAttempts     = 3
+	dockerSkillsDir        = "/skill2api/skills"
 	dockerCodexConfig      = `sandbox_mode = "danger-full-access"
 model_provider = "sandbox_runner"
 model = "gpt-5.6-luna"

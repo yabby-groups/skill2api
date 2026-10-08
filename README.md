@@ -176,7 +176,9 @@ cancelling the worker process. The prefix keeps Docker names valid when a
 request ID starts with `.`, `_`, or `-`.
 
 Only selected skill packages are also mounted, read-only, at
-`/workspace/skills/<skill_name>`. A multi-skill request uses an ordered,
+`/skill2api/skills/<skill_name>`, outside the task output mount. This avoids
+Docker creating root-owned mount target directories in the task output on the
+host. A multi-skill request uses an ordered,
 comma-separated `skill_name`, for example `"hypit,imagegen"`; Codex receives
 each selected `SKILL.md` in that order and a mapping to its package path.
 These namespaced mounts keep same-named resource directories such as

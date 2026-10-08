@@ -668,12 +668,12 @@ func TestDockerCodexCommandMountsOnlySelectedSkillPackages(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := "src=" + dir + ",dst=/workspace/skills/" + name + ",readonly"
+		want := "src=" + dir + ",dst=" + dockerSkillDir(name) + ",readonly"
 		if !strings.Contains(joined, want) {
 			t.Fatalf("Docker command missing selected skill mount %q: %q", want, cmd.Args)
 		}
 	}
-	if strings.Contains(joined, "unselected") || strings.Contains(joined, "src="+c.SkillsDir+",dst=/workspace/skills") {
+	if strings.Contains(joined, "unselected") || strings.Contains(joined, "dst=/workspace/skills") || strings.Contains(joined, "src="+c.SkillsDir+",dst="+dockerSkillsDir) {
 		t.Fatalf("Docker command exposed unselected skills: %q", cmd.Args)
 	}
 }
@@ -682,7 +682,7 @@ func TestCodexPromptSkillsPreservesContentAndAddsDockerResourceMap(t *testing.T)
 	prompt := "Make the deliverable."
 	skills := [][]byte{[]byte("first skill"), []byte("second skill")}
 	got := codexPromptSkills(prompt, skills, []string{"hypit", "imagegen"}, true)
-	want := prompt + "\n\nfirst skill\n\nsecond skill\n\nSelected skill packages are mounted read-only. Resolve package-relative resources using:\n- hypit: /workspace/skills/hypit\n- imagegen: /workspace/skills/imagegen\n"
+	want := prompt + "\n\nfirst skill\n\nsecond skill\n\nSelected skill packages are mounted read-only. Resolve package-relative resources using:\n- hypit: /skill2api/skills/hypit\n- imagegen: /skill2api/skills/imagegen\n"
 	if got != want {
 		t.Fatalf("multi-skill Docker prompt = %q, want %q", got, want)
 	}
