@@ -7,10 +7,14 @@ user decision.
 ## Prerequisites
 
 - The Periodic service is running.
-- The Skill2API worker registers `skill2api_generate`, `skill2api_status`,
-  `skill2api_file`, `skill2api_file_delivery`,
-  `skill2api_file_delivery_status`, `skill2api_resume`,
-  `skill2api_terminate`, and `skill2api_cleanup`.
+- Each worker requires a unique, safe `SKILL2API_NODE_ID`. It registers the
+  shared `skill2api_generate` entrypoint plus node-scoped follow-up functions:
+  `skill2api_status:<node_id>`, `skill2api_file:<node_id>`,
+  `skill2api_file_delivery:<node_id>`,
+  `skill2api_file_delivery_status:<node_id>`, `skill2api_resume:<node_id>`,
+  `skill2api_terminate:<node_id>`, and `skill2api_cleanup:<node_id>`.
+  `TASK_PREFIX`, when set, precedes the base function name, for example
+  `generation-skill2api_status:node-a`.
 - `skill_name` is one skill name or an ordered comma-separated list. Each name
   resolves to `SKILL2API_SKILLS_DIR/<skill_name>/SKILL.md`.
 - `output_dir` is a relative path inside `SKILL2API_OUTPUT_ROOT`.
@@ -36,16 +40,22 @@ periodic run skill2api_generate request-1 \
   --timeout 30
 ```
 
-An accepted submission only means that the job was queued:
+An accepted submission only means that the job was queued. Save its `node_id`:
 
 ```json
-{"request_id":"request-1","status":"queued"}
+{"request_id":"request-1","status":"queued","node_id":"node-a"}
 ```
+
+`skill2api_generate` is intentionally shared so Periodic can assign new work
+to any available worker. All task state, generated files, logs, Codex sessions,
+and cleanup remain local to that worker. Every later call for this request must
+therefore use the returned node suffix. A node ID must be unique across workers;
+there is no cross-node state replication or failover.
 
 ## Poll Status
 
 ```bash
-periodic run skill2api_status request-1 --timeout 30
+periodic run skill2api_status:node-a request-1 --timeout 30
 ```
 
 The status workload can be omitted; the worker derives `request_id` from the
@@ -93,7 +103,7 @@ may be in any state. The successful response is the file's raw binary bytes,
 not JSON or Base64; use `file_path` to retain the filename.
 
 ```bash
-periodic run skill2api_file request-1 \
+periodic run skill2api_file:node-a request-1 \
   --workload '{"request_id":"request-1","file_path":"package/output.png"}' \
   --timeout 30 | tail -c +9 > output.png
 ```
@@ -235,7 +245,7 @@ Sandbox Runner provider. Outbound network access is not configurable.
 Terminate a queued, running, or waiting-for-input task with the same request ID:
 
 ```bash
-periodic run skill2api_terminate request-1 --timeout 30
+periodic run skill2api_terminate:node-a request-1 --timeout 30
 ```
 
 The response is terminal and the task can no longer be resumed:
@@ -254,7 +264,7 @@ It is delayed for 24 hours, and its Periodic job name is the canonical request
 ID. It can also be invoked manually for one request:
 
 ```bash
-periodic run skill2api_cleanup request-1 --timeout 30
+periodic run skill2api_cleanup:node-a request-1 --timeout 30
 ```
 
 It deletes `succeeded`, `failed`, and `terminated` tasks, including
@@ -294,7 +304,7 @@ selected value. The same `skill2api_resume` endpoint also restores an
 `interrupted` request after a worker restart.
 
 ```bash
-periodic run skill2api_resume request-1 \
+periodic run skill2api_resume:node-a request-1 \
   --workload '{"request_id":"request-1","answer":"v2","environment":{"OPENAI_API_KEY":"provider-key-for-this-request"}}' \
   --timeout 30
 ```
@@ -303,7 +313,7 @@ To continue an interrupted task without adding instructions, omit both `answer`
 and `instruction`:
 
 ```bash
-periodic run skill2api_resume request-1 --timeout 30
+periodic run skill2api_resume:node-a request-1 --timeout 30
 ```
 
 To continue an interrupted or completed task with a follow-up instruction that
@@ -311,7 +321,7 @@ may add or modify files in the existing output directory, send `instruction`
 instead. A completed task requires a non-empty instruction:
 
 ```bash
-periodic run skill2api_resume request-1 \
+periodic run skill2api_resume:node-a request-1 \
   --workload '{"request_id":"request-1","instruction":"Add error handling and update README."}' \
   --timeout 30
 ```

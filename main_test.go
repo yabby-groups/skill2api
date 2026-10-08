@@ -30,7 +30,7 @@ func testConfig(t *testing.T) (config, string) {
 	if err := os.WriteFile(filepath.Join(skills, "demo", "SKILL.md"), []byte("make an API"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	return config{OutputRoot: root, SkillsDir: skills, CodexBin: "codex", Timeout: time.Second, MaxOutput: 16, MaxFileBytes: 1024}, root
+	return config{OutputRoot: root, SkillsDir: skills, CodexBin: "codex", NodeID: "node-a", Timeout: time.Second, MaxOutput: 16, MaxFileBytes: 1024}, root
 }
 
 func TestReadTaskFileReturnsBinaryAndAllowsInternalFiles(t *testing.T) {
@@ -905,8 +905,32 @@ func TestSubmitCleanupAtUsesRequestIDAndTerminalRetention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotFunc != "generation-skill2api_cleanup" || gotName != "request-1" || gotOptions["schedat"] != finishedAt.Add(retentionAge).Unix() {
+	if gotFunc != "generation-skill2api_cleanup:node-a" || gotName != "request-1" || gotOptions["schedat"] != finishedAt.Add(retentionAge).Unix() {
 		t.Fatalf("cleanup schedule = func=%q name=%q options=%#v", gotFunc, gotName, gotOptions)
+	}
+}
+
+func TestNodeFunctionNamesKeepGenerateShared(t *testing.T) {
+	c := config{TaskPrefix: "generation-", NodeID: "node-a"}
+	want := []string{
+		"generation-skill2api_generate",
+		"generation-skill2api_status:node-a",
+		"generation-skill2api_file:node-a",
+		"generation-skill2api_file_delivery:node-a",
+		"generation-skill2api_file_delivery_status:node-a",
+		"generation-skill2api_resume:node-a",
+		"generation-skill2api_terminate:node-a",
+		"generation-skill2api_cleanup:node-a",
+	}
+	if got := registeredFunctionNames(c); !reflect.DeepEqual(got, want) {
+		t.Fatalf("registered function names = %#v, want %#v", got, want)
+	}
+}
+
+func TestQueuedGenerateResponseIncludesNodeID(t *testing.T) {
+	got := queuedGenerateResponse("request-1", "node-a")
+	if got != (generateResponse{RequestID: "request-1", Status: "queued", NodeID: "node-a"}) {
+		t.Fatalf("generate response = %#v", got)
 	}
 }
 
@@ -1314,11 +1338,12 @@ func TestConfigPlainModeUsesPeriodicSettings(t *testing.T) {
 	t.Setenv("PERIODIC_RSA_PRIVATE_KEY_PATH", "")
 	t.Setenv("PERIODIC_RSA_PUBLIC_KEY_PATH", "")
 	t.Setenv("SKILL2API_OUTPUT_ROOT", t.TempDir())
+	t.Setenv("SKILL2API_NODE_ID", "node-a")
 	c, err := newConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.RSA.Mode != protocol.ModePlain || c.TaskPrefix != "generation-" || c.PeriodicAddr == "" {
+	if c.RSA.Mode != protocol.ModePlain || c.TaskPrefix != "generation-" || c.NodeID != "node-a" || c.PeriodicAddr == "" {
 		t.Fatalf("unexpected config: %#v", c)
 	}
 	if c.Timeout != 6*time.Hour {
@@ -1330,8 +1355,21 @@ func TestConfigPlainModeUsesPeriodicSettings(t *testing.T) {
 	if c.CodexNoProxy || c.CodexDocker || c.Debug || c.CodexDockerBin != "docker" || c.CodexDockerImage != "lupino/sandbox-runner:latest" {
 		t.Fatalf("direct provider settings should default to false: %#v", c)
 	}
-	if withPrefix(c.TaskPrefix, generateFunc) != "generation-skill2api_generate" || statusFunc != "skill2api_status" || cleanupFunc != "skill2api_cleanup" {
+	if withPrefix(c.TaskPrefix, generateFunc) != "generation-skill2api_generate" || nodeFunctionName(c, statusFunc) != "generation-skill2api_status:node-a" || nodeFunctionName(c, cleanupFunc) != "generation-skill2api_cleanup:node-a" {
 		t.Fatal("periodic function naming contract changed")
+	}
+}
+
+func TestConfigRequiresSafeNodeID(t *testing.T) {
+	t.Setenv("PERIODIC_PORT", "tcp://periodic:5000")
+	t.Setenv("PERIODIC_RSA_MODE", "0")
+	t.Setenv("SKILL2API_OUTPUT_ROOT", t.TempDir())
+	if _, err := newConfig(); err == nil || !strings.Contains(err.Error(), "SKILL2API_NODE_ID") {
+		t.Fatalf("missing node ID error = %v", err)
+	}
+	t.Setenv("SKILL2API_NODE_ID", "node:a")
+	if _, err := newConfig(); err == nil || !strings.Contains(err.Error(), "SKILL2API_NODE_ID") {
+		t.Fatalf("unsafe node ID error = %v", err)
 	}
 }
 
@@ -1339,6 +1377,7 @@ func TestConfigDebugOverride(t *testing.T) {
 	t.Setenv("PERIODIC_PORT", "tcp://periodic:5000")
 	t.Setenv("PERIODIC_RSA_MODE", "0")
 	t.Setenv("SKILL2API_OUTPUT_ROOT", t.TempDir())
+	t.Setenv("SKILL2API_NODE_ID", "node-a")
 	t.Setenv("SKILL2API_DEBUG", "true")
 	c, err := newConfig()
 	if err != nil {
@@ -1357,6 +1396,7 @@ func TestConfigCodexTimeoutOverride(t *testing.T) {
 	t.Setenv("PERIODIC_PORT", "tcp://periodic:5000")
 	t.Setenv("PERIODIC_RSA_MODE", "0")
 	t.Setenv("SKILL2API_OUTPUT_ROOT", t.TempDir())
+	t.Setenv("SKILL2API_NODE_ID", "node-a")
 	t.Setenv("SKILL2API_CODEX_TIMEOUT_SECONDS", "28800")
 	c, err := newConfig()
 	if err != nil {
@@ -1371,6 +1411,7 @@ func TestConfigUploadTimeoutOverride(t *testing.T) {
 	t.Setenv("PERIODIC_PORT", "tcp://periodic:5000")
 	t.Setenv("PERIODIC_RSA_MODE", "0")
 	t.Setenv("SKILL2API_OUTPUT_ROOT", t.TempDir())
+	t.Setenv("SKILL2API_NODE_ID", "node-a")
 	t.Setenv("SKILL2API_FILE_UPLOAD_TIMEOUT_SECONDS", "180")
 	c, err := newConfig()
 	if err != nil {
@@ -1389,6 +1430,7 @@ func TestConfigCodexDocker(t *testing.T) {
 	t.Setenv("PERIODIC_PORT", "tcp://periodic:5000")
 	t.Setenv("PERIODIC_RSA_MODE", "0")
 	t.Setenv("SKILL2API_OUTPUT_ROOT", t.TempDir())
+	t.Setenv("SKILL2API_NODE_ID", "node-a")
 	t.Setenv("SKILL2API_CODEX_DOCKER", "true")
 	t.Setenv("SKILL2API_CODEX_DOCKER_BIN", "podman")
 	t.Setenv("SKILL2API_CODEX_DOCKER_IMAGE", "registry.example/sandbox:1")
@@ -1409,6 +1451,7 @@ func TestConfigCodexDockerOptDir(t *testing.T) {
 	t.Setenv("PERIODIC_PORT", "tcp://periodic:5000")
 	t.Setenv("PERIODIC_RSA_MODE", "0")
 	t.Setenv("SKILL2API_OUTPUT_ROOT", t.TempDir())
+	t.Setenv("SKILL2API_NODE_ID", "node-a")
 	t.Setenv("SKILL2API_CODEX_DOCKER", "true")
 	optDir := t.TempDir()
 	t.Setenv("SKILL2API_CODEX_DOCKER_OPT_DIR", optDir)

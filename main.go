@@ -70,6 +70,12 @@ type generateRequest struct {
 	Force       bool              `json:"force"`
 }
 
+type generateResponse struct {
+	RequestID string `json:"request_id"`
+	Status    string `json:"status"`
+	NodeID    string `json:"node_id"`
+}
+
 type statusRequest struct {
 	RequestID string `json:"request_id"`
 }
@@ -191,6 +197,7 @@ func statusWithLogOutput(v taskStatus, limit int) (statusResponse, error) {
 type config struct {
 	PeriodicAddr      string
 	TaskPrefix        string
+	NodeID            string
 	RSA               protocol.RSAConnParam
 	OutputRoot        string
 	SkillsDir         string
@@ -247,6 +254,10 @@ func newConfig() (config, error) {
 	addr := strings.TrimRight(strings.TrimSpace(os.Getenv("PERIODIC_PORT")), "/")
 	if addr == "" {
 		return config{}, errors.New("PERIODIC_PORT is required")
+	}
+	nodeID := strings.TrimSpace(os.Getenv("SKILL2API_NODE_ID"))
+	if !validID(nodeID) {
+		return config{}, errors.New("SKILL2API_NODE_ID must be a safe non-empty identifier")
 	}
 	root, err := filepath.Abs(strings.TrimSpace(os.Getenv("SKILL2API_OUTPUT_ROOT")))
 	if err != nil || root == "." || strings.TrimSpace(os.Getenv("SKILL2API_OUTPUT_ROOT")) == "" {
@@ -313,7 +324,7 @@ func newConfig() (config, error) {
 	if err != nil || uploadURL.Scheme == "" || uploadURL.Host == "" {
 		return config{}, errors.New("SKILL2API_UPLOAD_BASE_URL must be an absolute URL")
 	}
-	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexDockerOptDir: optDir, CodexNoProxy: noProxy, Debug: debug, UploadBaseURL: uploadBaseURL, UploadTimeout: uploadTimeout, Timeout: timeout, MaxOutput: limit, MaxFileBytes: fileLimit}, nil
+	return config{PeriodicAddr: addr, TaskPrefix: strings.TrimSpace(os.Getenv("TASK_PREFIX")), NodeID: nodeID, RSA: protocol.RSAConnParam{Mode: mode, PrivateKeyPath: priv, ServerPublicKeyPath: pub}, OutputRoot: root, SkillsDir: skills, CodexBin: firstEnvDefault("SKILL2API_CODEX_BIN", "codex"), CodexDocker: dockerEnabled, CodexDockerBin: firstEnvDefault("SKILL2API_CODEX_DOCKER_BIN", "docker"), CodexDockerImage: firstEnvDefault("SKILL2API_CODEX_DOCKER_IMAGE", "lupino/sandbox-runner:latest"), CodexDockerOptDir: optDir, CodexNoProxy: noProxy, Debug: debug, UploadBaseURL: uploadBaseURL, UploadTimeout: uploadTimeout, Timeout: timeout, MaxOutput: limit, MaxFileBytes: fileLimit}, nil
 }
 func firstEnvDefault(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -346,6 +357,10 @@ func parseRSAMode(raw string) (int, error) {
 	return n, nil
 }
 func withPrefix(prefix, fn string) string { return strings.TrimSpace(prefix) + fn }
+
+func nodeFunctionName(c config, fn string) string {
+	return withPrefix(c.TaskPrefix, fn) + ":" + c.NodeID
+}
 
 func (s *statusStore) path(id string) string { return filepath.Join(s.root, id, "status.json") }
 func (s *statusStore) deliveryDir(id string) string {
@@ -634,7 +649,7 @@ func terminalStatus(status string) bool {
 type cleanupSubmitter func(string, string, map[string]interface{}) error
 
 func submitCleanupAt(submit cleanupSubmitter, c config, requestID string, startedAt time.Time) error {
-	return submit(withPrefix(c.TaskPrefix, cleanupFunc), requestID, map[string]interface{}{
+	return submit(nodeFunctionName(c, cleanupFunc), requestID, map[string]interface{}{
 		"schedat": startedAt.Add(retentionAge).Unix(),
 	})
 }
@@ -1963,6 +1978,11 @@ func doneJSON(job periodic.Job, payload any) {
 	}
 	_ = job.Done(data)
 }
+
+func queuedGenerateResponse(requestID, nodeID string) generateResponse {
+	return generateResponse{RequestID: requestID, Status: "queued", NodeID: nodeID}
+}
+
 func handleGenerate(job periodic.Job, store *statusStore, manager *taskManager, c config) {
 	var req generateRequest
 	if err := parseArgs(job, &req); err != nil {
@@ -2005,7 +2025,7 @@ func handleGenerate(job periodic.Job, store *statusStore, manager *taskManager, 
 	}
 	log.Printf("event=skill2api_state request_id=%s status=queued skill_name=%s output_dir=%s force=%t", req.RequestID, req.SkillName, req.OutputDir, req.Force)
 	scheduleCleanup(c, req.RequestID)
-	doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "queued"})
+	doneJSON(job, queuedGenerateResponse(req.RequestID, c.NodeID))
 	go execute(store, manager, c, req)
 }
 func handleStatus(job periodic.Job, store *statusStore, c config) {
@@ -2328,8 +2348,7 @@ func handleCleanup(job periodic.Job, store *statusStore, c config) {
 	doneJSON(job, result)
 }
 
-func addWorkerFunc(worker *periodic.Worker, prefix, name string, handler func(periodic.Job)) error {
-	function := withPrefix(prefix, name)
+func addWorkerFunc(worker *periodic.Worker, function string, handler func(periodic.Job)) error {
 	if err := worker.AddFunc(function, handler); err != nil {
 		log.Printf("event=skill2api_register function=%s result=failed error=%q", function, err)
 		return err
@@ -2338,29 +2357,43 @@ func addWorkerFunc(worker *periodic.Worker, prefix, name string, handler func(pe
 	return nil
 }
 
-func registerWorkerFuncs(worker *periodic.Worker, prefix string, store *statusStore, manager *taskManager, c config) error {
-	if err := addWorkerFunc(worker, prefix, generateFunc, func(job periodic.Job) { handleGenerate(job, store, manager, c) }); err != nil {
+func registeredFunctionNames(c config) []string {
+	return []string{
+		withPrefix(c.TaskPrefix, generateFunc),
+		nodeFunctionName(c, statusFunc),
+		nodeFunctionName(c, fileFunc),
+		nodeFunctionName(c, fileDeliveryFunc),
+		nodeFunctionName(c, fileDeliveryStatusFunc),
+		nodeFunctionName(c, resumeFunc),
+		nodeFunctionName(c, terminateFunc),
+		nodeFunctionName(c, cleanupFunc),
+	}
+}
+
+func registerWorkerFuncs(worker *periodic.Worker, store *statusStore, manager *taskManager, c config) error {
+	functions := registeredFunctionNames(c)
+	if err := addWorkerFunc(worker, functions[0], func(job periodic.Job) { handleGenerate(job, store, manager, c) }); err != nil {
 		return err
 	}
-	if err := addWorkerFunc(worker, prefix, statusFunc, func(job periodic.Job) { handleStatus(job, store, c) }); err != nil {
+	if err := addWorkerFunc(worker, functions[1], func(job periodic.Job) { handleStatus(job, store, c) }); err != nil {
 		return err
 	}
-	if err := addWorkerFunc(worker, prefix, fileFunc, func(job periodic.Job) { handleFile(job, store, c) }); err != nil {
+	if err := addWorkerFunc(worker, functions[2], func(job periodic.Job) { handleFile(job, store, c) }); err != nil {
 		return err
 	}
-	if err := addWorkerFunc(worker, prefix, fileDeliveryFunc, func(job periodic.Job) { handleFileDelivery(job, store, c) }); err != nil {
+	if err := addWorkerFunc(worker, functions[3], func(job periodic.Job) { handleFileDelivery(job, store, c) }); err != nil {
 		return err
 	}
-	if err := addWorkerFunc(worker, prefix, fileDeliveryStatusFunc, func(job periodic.Job) { handleFileDeliveryStatus(job, store) }); err != nil {
+	if err := addWorkerFunc(worker, functions[4], func(job periodic.Job) { handleFileDeliveryStatus(job, store) }); err != nil {
 		return err
 	}
-	if err := addWorkerFunc(worker, prefix, resumeFunc, func(job periodic.Job) { handleResume(job, store, manager, c) }); err != nil {
+	if err := addWorkerFunc(worker, functions[5], func(job periodic.Job) { handleResume(job, store, manager, c) }); err != nil {
 		return err
 	}
-	if err := addWorkerFunc(worker, prefix, terminateFunc, func(job periodic.Job) { handleTerminate(job, store, manager, c) }); err != nil {
+	if err := addWorkerFunc(worker, functions[6], func(job periodic.Job) { handleTerminate(job, store, manager, c) }); err != nil {
 		return err
 	}
-	return addWorkerFunc(worker, prefix, cleanupFunc, func(job periodic.Job) { handleCleanup(job, store, c) })
+	return addWorkerFunc(worker, functions[7], func(job periodic.Job) { handleCleanup(job, store, c) })
 }
 func connectPeriodic(client *periodic.Client, addr string, rsa protocol.RSAConnParam) error {
 	return client.Connect(addr, rsa)
@@ -2371,7 +2404,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	log.Printf("event=skill2api_starting output_root=%s skills_dir=%s task_prefix=%s timeout_seconds=%d", c.OutputRoot, c.SkillsDir, c.TaskPrefix, int(c.Timeout.Seconds()))
+	log.Printf("event=skill2api_starting output_root=%s skills_dir=%s task_prefix=%s node_id=%s timeout_seconds=%d", c.OutputRoot, c.SkillsDir, c.TaskPrefix, c.NodeID, int(c.Timeout.Seconds()))
 	store := &statusStore{root: c.OutputRoot}
 	manager := newTaskManager()
 	if err := os.MkdirAll(c.OutputRoot, 0750); err != nil {
@@ -2392,7 +2425,7 @@ func main() {
 			continue
 		}
 		log.Printf("event=skill2api_connect result=connected")
-		if err := registerWorkerFuncs(worker, c.TaskPrefix, store, manager, c); err != nil {
+		if err := registerWorkerFuncs(worker, store, manager, c); err != nil {
 			log.Printf("event=skill2api_startup result=registration_failed error=%q", err)
 			worker.Close()
 			time.Sleep(time.Second)
