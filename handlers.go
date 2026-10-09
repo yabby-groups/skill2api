@@ -17,49 +17,71 @@ func parseArgs[T any](job periodic.Job, out *T) error {
 	}
 	return json.Unmarshal([]byte(job.Args), out)
 }
-func doneJSON(job periodic.Job, payload any) {
+func marshalJobResponse(requestID string, payload any) []byte {
 	data, err := json.Marshal(payload)
 	if err != nil {
-		_ = job.Fail()
-		return
+		log.Printf("event=skill2api_response request_id=%s result=encode_failed", requestID)
+		data, _ = json.Marshal(map[string]string{
+			"request_id": requestID, "status": "failed",
+			"error": "worker response could not be encoded",
+		})
 	}
-	_ = job.Done(data)
+	return data
+}
+
+func doneJSON(job periodic.Job, payload any) {
+	if err := job.Done(marshalJobResponse(job.Name, payload)); err != nil {
+		log.Printf("event=skill2api_response request_id=%s result=send_failed error=%q", job.Name, err)
+	}
+}
+
+func failJSON(job periodic.Job, message string) {
+	doneJSON(job, map[string]string{
+		"request_id": job.Name, "status": "failed", "error": message,
+	})
 }
 
 func queuedGenerateResponse(requestID, nodeID string) generateResponse {
 	return generateResponse{RequestID: requestID, Status: "queued", NodeID: nodeID}
 }
 
+func rejectGenerate(job periodic.Job, c config, err error) {
+	doneJSON(job, map[string]any{
+		"request_id": job.Name, "node_id": c.NodeID,
+		"status": "rejected", "error": err.Error(),
+	})
+}
+
 func handleGenerate(job periodic.Job, store *statusStore, manager *taskManager, c config) {
 	var req generateRequest
 	if err := parseArgs(job, &req); err != nil {
 		log.Printf("event=skill2api_generate request_id=%s result=invalid_args error=%q", req.RequestID, err)
-		_ = job.Fail()
+		rejectGenerate(job, c, errors.New("invalid generation arguments"))
 		return
 	}
 	if strings.TrimSpace(req.RequestID) == "" {
 		req.RequestID = job.Name
 	} else if req.RequestID != job.Name {
 		log.Printf("event=skill2api_generate request_id=%s result=request_id_mismatch job_name=%s", req.RequestID, job.Name)
-		_ = job.Fail()
+		rejectGenerate(job, c, errors.New("request_id does not match job name"))
 		return
 	}
 	if err := validateRequest(req, c); err != nil {
 		log.Printf("event=skill2api_generate request_id=%s result=validation_failed skill_name=%s output_dir=%s error=%q", req.RequestID, req.SkillName, req.OutputDir, err)
-		_ = job.Fail()
+		rejectGenerate(job, c, err)
 		return
 	}
 	names, err := skillNames(c, req.SkillName)
 	if err != nil {
 		log.Printf("event=skill2api_generate request_id=%s result=validation_failed skill_name=%s output_dir=%s error=%q", req.RequestID, req.SkillName, req.OutputDir, err)
-		_ = job.Fail()
+		rejectGenerate(job, c, err)
 		return
 	}
 	req.SkillName = strings.Join(names, ",")
 	outputDir, err := resolveOutputDir(req.OutputDir, c.OutputRoot)
 	if err != nil {
 		log.Printf("event=skill2api_generate request_id=%s result=validation_failed skill_name=%s output_dir=%s error=%q", req.RequestID, req.SkillName, req.OutputDir, err)
-		_ = job.Fail()
+		rejectGenerate(job, c, err)
 		return
 	}
 	req.OutputDir = outputDir
@@ -67,7 +89,7 @@ func handleGenerate(job periodic.Job, store *statusStore, manager *taskManager, 
 	v := taskStatus{RequestID: req.RequestID, Status: "queued", CreatedAt: now, SkillName: req.SkillName, Model: req.Model, OutputDir: req.OutputDir}
 	if err := store.create(v, req.Force); err != nil {
 		log.Printf("event=skill2api_generate request_id=%s result=duplicate error=%q", req.RequestID, err)
-		_ = job.Fail()
+		rejectGenerate(job, c, err)
 		return
 	}
 	log.Printf("event=skill2api_state request_id=%s status=queued skill_name=%s output_dir=%s force=%t", req.RequestID, req.SkillName, req.OutputDir, req.Force)
@@ -80,7 +102,7 @@ func handleStatus(job periodic.Job, store *statusStore, c config) {
 	if strings.TrimSpace(job.Args) != "" {
 		if err := parseArgs(job, &req); err != nil {
 			log.Printf("event=skill2api_status request_id=%s result=invalid_args", req.RequestID)
-			_ = job.Fail()
+			failJSON(job, "invalid status request")
 			return
 		}
 	}
@@ -88,12 +110,12 @@ func handleStatus(job periodic.Job, store *statusStore, c config) {
 		req.RequestID = job.Name
 	} else if req.RequestID != job.Name {
 		log.Printf("event=skill2api_status request_id=%s result=request_id_mismatch job_name=%s", req.RequestID, job.Name)
-		_ = job.Fail()
+		failJSON(job, "request_id must match job name")
 		return
 	}
 	if !validID(req.RequestID) {
 		log.Printf("event=skill2api_status request_id=%s result=invalid_args", req.RequestID)
-		_ = job.Fail()
+		failJSON(job, "invalid request_id")
 		return
 	}
 	v, err := store.read(req.RequestID)
@@ -248,22 +270,26 @@ func handleResume(job periodic.Job, store *statusStore, manager *taskManager, c 
 	var req resumeRequest
 	if strings.TrimSpace(job.Args) != "" {
 		if err := parseArgs(job, &req); err != nil {
-			_ = job.Fail()
+			failJSON(job, "invalid resume request")
 			return
 		}
 	}
 	if strings.TrimSpace(req.RequestID) == "" {
 		req.RequestID = job.Name
 	} else if req.RequestID != job.Name {
-		_ = job.Fail()
+		failJSON(job, "request_id must match job name")
 		return
 	}
-	if !validID(req.RequestID) || (strings.TrimSpace(req.Answer) != "" && strings.TrimSpace(req.Instruction) != "") {
-		_ = job.Fail()
+	if !validID(req.RequestID) {
+		failJSON(job, "invalid request_id")
+		return
+	}
+	if strings.TrimSpace(req.Answer) != "" && strings.TrimSpace(req.Instruction) != "" {
+		failJSON(job, "answer and instruction cannot both be supplied")
 		return
 	}
 	if err := validateEnvironment(req.Environment); err != nil {
-		_ = job.Fail()
+		failJSON(job, err.Error())
 		return
 	}
 	v, err := store.read(req.RequestID)
@@ -326,18 +352,18 @@ func handleTerminate(job periodic.Job, store *statusStore, manager *taskManager,
 	var req terminateRequest
 	if strings.TrimSpace(job.Args) != "" {
 		if err := parseArgs(job, &req); err != nil {
-			_ = job.Fail()
+			failJSON(job, "invalid terminate request")
 			return
 		}
 	}
 	if strings.TrimSpace(req.RequestID) == "" {
 		req.RequestID = job.Name
 	} else if req.RequestID != job.Name {
-		_ = job.Fail()
+		failJSON(job, "request_id must match job name")
 		return
 	}
 	if !validID(req.RequestID) {
-		_ = job.Fail()
+		failJSON(job, "invalid request_id")
 		return
 	}
 	v, err := store.terminate(req.RequestID)
@@ -367,7 +393,7 @@ func handleCleanup(job periodic.Job, store *statusStore, c config) {
 	if strings.TrimSpace(job.Args) != "" {
 		if err := parseArgs(job, &req); err != nil {
 			log.Printf("event=skill2api_cleanup result=invalid_args")
-			_ = job.Fail()
+			failJSON(job, "invalid cleanup request")
 			return
 		}
 	}
@@ -375,12 +401,12 @@ func handleCleanup(job periodic.Job, store *statusStore, c config) {
 		req.RequestID = job.Name
 	} else if req.RequestID != job.Name {
 		log.Printf("event=skill2api_cleanup result=invalid_args")
-		_ = job.Fail()
+		failJSON(job, "request_id must match job name")
 		return
 	}
 	if !validID(req.RequestID) {
 		log.Printf("event=skill2api_cleanup request_id=%s result=invalid_args", req.RequestID)
-		_ = job.Fail()
+		failJSON(job, "invalid request_id")
 		return
 	}
 	now := time.Now().UTC()
@@ -388,7 +414,7 @@ func handleCleanup(job periodic.Job, store *statusStore, c config) {
 	if delay, reschedule := cleanupRescheduleDelay(result, now); reschedule {
 		if err := job.SchedLater(delay); err != nil {
 			log.Printf("event=skill2api_cleanup request_id=%s result=reschedule_failed error=%q", req.RequestID, err)
-			_ = job.Fail()
+			failJSON(job, "cleanup reschedule failed: "+err.Error())
 		}
 		return
 	}

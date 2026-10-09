@@ -46,6 +46,18 @@ An accepted submission only means that the job was queued. Save its `node_id`:
 {"request_id":"request-1","status":"queued","node_id":"node-a"}
 ```
 
+Validation failures return JSON with `status: "rejected"`, `request_id`,
+`node_id`, and `error`. No generation is scheduled for a rejected submission.
+The HTTP bridge preserves `request_id` on rejected or unconfirmed submissions.
+An unconfirmed acknowledgement does not prove that generation was rejected;
+check worker logs for that request ID before submitting another job.
+
+All control and cleanup validation errors also complete with JSON containing
+`request_id`, `status: "failed"`, and `error`; they never use a bare Periodic
+failure reply. Response encoding failures return the same safe JSON envelope.
+If the transport itself cannot send the reply, the worker logs `send_failed`;
+the caller must treat that outcome as unconfirmed.
+
 `skill2api_generate` is intentionally shared so Periodic can assign new work
 to any available worker. All task state, generated files, logs, Codex sessions,
 and cleanup remain local to that worker. Every later call for this request must
