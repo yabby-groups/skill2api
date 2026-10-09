@@ -197,9 +197,9 @@ func uploadTemporaryFile(ctx context.Context, c config, req fileRequest, data []
 	if err := validateEnvironment(req.Environment); err != nil {
 		return nil, "", err
 	}
-	apiKey := strings.TrimSpace(req.Environment["SANDBOX_AI_KEY"])
+	apiKey := strings.TrimSpace(req.Environment["OPENAI_API_KEY"])
 	if apiKey == "" {
-		return nil, "", errors.New("SANDBOX_AI_KEY is required for file upload")
+		return nil, "", errors.New("OPENAI_API_KEY is required for file upload")
 	}
 	fileKey := fileKeyForData(data)
 	if file, uploadURL, found, err := resolveTemporaryFile(ctx, c, apiKey, fileKey); err != nil {

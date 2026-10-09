@@ -32,7 +32,7 @@ periodic run skill2api_generate request-1 \
     "output_dir": "request-1",
     "prompt": "Generate the requested health-check package.",
     "environment": {
-      "SANDBOX_AI_KEY": "provider-key-for-this-request"
+      "OPENAI_API_KEY": "provider-key-for-this-request"
     },
     "model": "gpt-6-sol",
     "force": false
@@ -191,14 +191,14 @@ provider configuration to the task's private
 
 ```toml
 sandbox_mode = "danger-full-access"
-model_provider = "sandbox_runner"
-model = "gpt-5.6-luna"
+model_provider = "huabot"
+model = "gpt-6-luna"
 
-[model_providers.sandbox_runner]
-name = "Sandbox Runner"
+[model_providers.huabot]
+name = "Huabot API"
 base_url = "https://huabot.com/v1"
 wire_api = "responses"
-env_key = "SANDBOX_AI_KEY"
+env_key = "OPENAI_API_KEY"
 supports_websockets = false
 
 [projects."/workspace"]
@@ -216,10 +216,20 @@ The Docker UID/GID must be able to read and execute every required directory
 and executable. Leave this variable unset to retain the default mounts and
 container `PATH`.
 
-Pass `SANDBOX_AI_KEY` in the request `environment` object on every generation
+Pass `OPENAI_API_KEY` in the request `environment` object on every generation
 and resume. This request value takes precedence. When omitted, the worker's
-`SANDBOX_AI_KEY` environment variable is used as a deployment-level fallback.
-Neither source is persisted or returned.
+`OPENAI_API_KEY` environment variable is used as a deployment-level fallback.
+Neither source is persisted or returned. `SANDBOX_AI_KEY` is no longer used;
+rename it to `OPENAI_API_KEY` in deployments and caller workloads.
+
+`OPENAI_BASE_URL` selects the model API endpoint for generation and resume.
+A non-empty request `environment.OPENAI_BASE_URL` takes precedence over the
+worker environment variable; blank or omitted values fall back to the worker
+value, then to `https://huabot.com/v1`. The effective URL is passed to skill
+processes and written as the Docker Codex provider's `base_url` before each run.
+The TOML example above shows the default URL. File uploads continue to use
+`SKILL2API_UPLOAD_BASE_URL` and require `environment.OPENAI_API_KEY` in the
+upload request.
 
 ## Codex Execution Timeout
 

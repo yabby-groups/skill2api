@@ -136,7 +136,7 @@ func TestUploadTemporaryFileUsesTokenCredentialAndReturnsRelativeURL(t *testing.
 
 	file, uploadURL, err := uploadTemporaryFile(context.Background(), config{UploadBaseURL: server.URL}, fileRequest{
 		FilePath:    "outputs/result.mp4",
-		Environment: map[string]string{"SANDBOX_AI_KEY": "private-key"},
+		Environment: map[string]string{"OPENAI_API_KEY": "private-key"},
 	}, []byte("video"))
 	if err != nil {
 		t.Fatal(err)
@@ -168,7 +168,7 @@ func TestUploadTemporaryFileReusesResolvedContent(t *testing.T) {
 
 	file, uploadURL, err := uploadTemporaryFile(context.Background(), config{UploadBaseURL: server.URL}, fileRequest{
 		FilePath:    "outputs/result.mp4",
-		Environment: map[string]string{"SANDBOX_AI_KEY": "private-key"},
+		Environment: map[string]string{"OPENAI_API_KEY": "private-key"},
 	}, []byte("video"))
 	if err != nil {
 		t.Fatal(err)
@@ -583,13 +583,14 @@ func TestCodexEnvironmentOverlaysAndFiltersProxy(t *testing.T) {
 }
 
 func TestDockerCodexCommandIsolatedAndReceivesExplicitEnvironment(t *testing.T) {
+	t.Setenv("OPENAI_BASE_URL", "")
 	c, root := testConfig(t)
 	c.CodexDocker, c.CodexDockerBin, c.CodexDockerImage = true, "docker-test", "example/sandbox:tag"
 	outputDir := filepath.Join(root, "request-1")
 	if err := os.MkdirAll(outputDir, 0750); err != nil {
 		t.Fatal(err)
 	}
-	cmd, executable, err := newCodexCommand(context.Background(), c, "-request-1", outputDir, map[string]string{"SANDBOX_AI_KEY": "client-key", "OTHER_TOKEN": "other-value"}, codexExecArgs(c, "", outputDir, []string{"prompt"}))
+	cmd, executable, err := newCodexCommand(context.Background(), c, "-request-1", outputDir, map[string]string{"OPENAI_API_KEY": "client-key", "OTHER_TOKEN": "other-value"}, codexExecArgs(c, "", outputDir, []string{"prompt"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -597,7 +598,7 @@ func TestDockerCodexCommandIsolatedAndReceivesExplicitEnvironment(t *testing.T) 
 		t.Fatalf("unexpected executable: %q (%q)", executable, cmd.Path)
 	}
 	joined := strings.Join(cmd.Args, "\n")
-	for _, want := range []string{"run", "--rm", "--name\nskill2api--request-1", "--init", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), "dst=/workspace", "dst=/home/ubuntu", "--workdir\n/workspace", "--env\nHOME=/home/ubuntu", "--env\nSANDBOX_AI_KEY", "--env\nOTHER_TOKEN", "example/sandbox:tag\ncodex\nexec", "--sandbox\ndanger-full-access", "--cd\n/workspace"} {
+	for _, want := range []string{"run", "--rm", "--name\nskill2api--request-1", "--init", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), "dst=/workspace", "dst=/home/ubuntu", "--workdir\n/workspace", "--env\nHOME=/home/ubuntu", "--env\nOPENAI_API_KEY", "--env\nOTHER_TOKEN", "example/sandbox:tag\ncodex\nexec", "--sandbox\ndanger-full-access", "--cd\n/workspace"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("docker command missing %q: %q", want, joined)
 		}
@@ -638,7 +639,7 @@ func TestDockerCodexCommandIsolatedAndReceivesExplicitEnvironment(t *testing.T) 
 	if strings.Contains(string(configData), "client-key") || strings.Contains(string(configData), "other-value") {
 		t.Fatalf("Docker Codex config persisted request environment: %q", configData)
 	}
-	if !strings.Contains(strings.Join(cmd.Env, "\n"), "SANDBOX_AI_KEY=client-key") {
+	if !strings.Contains(strings.Join(cmd.Env, "\n"), "OPENAI_API_KEY=client-key") {
 		t.Fatalf("client key was not forwarded to Docker: %#v", cmd.Env)
 	}
 }
@@ -760,14 +761,77 @@ func TestDockerCodexOptionalOptMountAndPath(t *testing.T) {
 }
 
 func TestDockerCodexEnvironmentFallsBackToWorkerKey(t *testing.T) {
-	t.Setenv("SANDBOX_AI_KEY", "worker-key")
+	t.Setenv("OPENAI_API_KEY", "worker-key")
 	values := codexRequestEnvironment(config{CodexDocker: true}, map[string]string{"OTHER": "value"})
-	if values["SANDBOX_AI_KEY"] != "worker-key" {
+	if values["OPENAI_API_KEY"] != "worker-key" {
 		t.Fatalf("worker fallback was not used: %#v", values)
 	}
-	values = codexRequestEnvironment(config{CodexDocker: true}, map[string]string{"SANDBOX_AI_KEY": "client-key"})
-	if values["SANDBOX_AI_KEY"] != "client-key" {
+	values = codexRequestEnvironment(config{CodexDocker: true}, map[string]string{"OPENAI_API_KEY": "client-key"})
+	if values["OPENAI_API_KEY"] != "client-key" {
 		t.Fatalf("client key did not take precedence: %#v", values)
+	}
+}
+
+func TestCodexProviderEnvironment(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "worker-key")
+	t.Setenv("SANDBOX_AI_KEY", "legacy-key")
+	for _, tc := range []struct {
+		name, workerURL, requestURL, want string
+	}{
+		{"default", "", "", "https://huabot.com/v1"},
+		{"worker", "https://worker.example/v1", "", "https://worker.example/v1"},
+		{"request", "https://worker.example/v1", "https://request.example/v1", "https://request.example/v1"},
+		{"blank request", "https://worker.example/v1", "  ", "https://worker.example/v1"},
+		{"blank worker", "  ", "", "https://huabot.com/v1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OPENAI_BASE_URL", tc.workerURL)
+			for _, docker := range []bool{false, true} {
+				input := map[string]string{"OPENAI_BASE_URL": tc.requestURL, "OPENAI_API_KEY": "request-key"}
+				got := codexRequestEnvironment(config{CodexDocker: docker}, input)
+				if got["OPENAI_BASE_URL"] != tc.want || got["OPENAI_API_KEY"] != "request-key" {
+					t.Fatalf("unexpected effective environment")
+				}
+				if input["OPENAI_BASE_URL"] != tc.requestURL {
+					t.Fatal("request environment was mutated")
+				}
+			}
+		})
+	}
+	t.Setenv("OPENAI_API_KEY", "")
+	if got := codexRequestEnvironment(config{CodexDocker: true}, nil); got["OPENAI_API_KEY"] == "legacy-key" {
+		t.Fatal("legacy key was used")
+	}
+}
+
+func TestDockerProviderURLConfiguration(t *testing.T) {
+	c, root := testConfig(t)
+	c.CodexDocker, c.CodexDockerBin, c.CodexDockerImage = true, "docker-test", "example/sandbox:tag"
+	url := "https://provider.example/v1?value=\"quoted\"&next=\\path"
+	cmd, _, err := newCodexCommand(context.Background(), c, "custom-url", root, map[string]string{"OPENAI_BASE_URL": url, "OPENAI_API_KEY": "secret-key"}, []string{"exec"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(codexHomeDir(c, "custom-url"), ".codex", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	quoted, _ := json.Marshal(url)
+	if !strings.Contains(string(data), "base_url = "+string(quoted)) || !strings.Contains(string(data), `env_key = "OPENAI_API_KEY"`) {
+		t.Fatalf("unexpected provider config: %s", data)
+	}
+	if !strings.Contains(strings.Join(cmd.Env, "\n"), "OPENAI_BASE_URL="+url) || !strings.Contains(strings.Join(cmd.Args, "\n"), "--env\nOPENAI_BASE_URL") {
+		t.Fatal("effective URL was not forwarded")
+	}
+	if strings.Contains(string(data), "secret-key") || strings.Contains(strings.Join(cmd.Args, "\n"), "secret-key") {
+		t.Fatal("key was exposed")
+	}
+}
+
+func TestUploadRejectsLegacyKey(t *testing.T) {
+	_, _, err := uploadTemporaryFile(context.Background(), config{}, fileRequest{Environment: map[string]string{"SANDBOX_AI_KEY": "legacy-key"}}, nil)
+	if err == nil || err.Error() != "OPENAI_API_KEY is required for file upload" {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

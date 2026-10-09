@@ -30,14 +30,14 @@ const (
 	fileUploadAttempts     = 3
 	dockerSkillsDir        = "/skill2api/skills"
 	dockerCodexConfig      = `sandbox_mode = "danger-full-access"
-model_provider = "sandbox_runner"
-model = "gpt-5.6-luna"
+model_provider = "huabot"
+model = "gpt-6-luna"
 
-[model_providers.sandbox_runner]
-name = "Sandbox Runner"
+[model_providers.huabot]
+name = "Huabot API"
 base_url = "https://huabot.com/v1"
 wire_api = "responses"
-env_key = "SANDBOX_AI_KEY"
+env_key = "OPENAI_API_KEY"
 supports_websockets = false
 
 [projects."/workspace"]

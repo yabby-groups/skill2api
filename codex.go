@@ -225,17 +225,25 @@ func commandExitCode(err error) int {
 }
 
 func codexRequestEnvironment(c config, values map[string]string) map[string]string {
-	merged := make(map[string]string, len(values)+1)
+	merged := make(map[string]string, len(values)+2)
 	for key, value := range values {
 		merged[key] = value
 	}
 	if c.CodexDocker {
-		if _, provided := merged["SANDBOX_AI_KEY"]; !provided {
-			if value, ok := os.LookupEnv("SANDBOX_AI_KEY"); ok {
-				merged["SANDBOX_AI_KEY"] = value
+		if _, provided := merged["OPENAI_API_KEY"]; !provided {
+			if value, ok := os.LookupEnv("OPENAI_API_KEY"); ok {
+				merged["OPENAI_API_KEY"] = value
 			}
 		}
 	}
+	baseURL := strings.TrimSpace(merged["OPENAI_BASE_URL"])
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(os.Getenv("OPENAI_BASE_URL"))
+	}
+	if baseURL == "" {
+		baseURL = "https://huabot.com/v1"
+	}
+	merged["OPENAI_BASE_URL"] = baseURL
 	return merged
 }
 
@@ -261,13 +269,18 @@ func codexHomeDir(c config, requestID string) string {
 	return filepath.Join(c.OutputRoot, ".skill2api-codex", requestID, "home")
 }
 
-func prepareDockerCodexHome(home string) error {
+func prepareDockerCodexHome(home, baseURL string) error {
 	configDir := filepath.Join(home, ".codex")
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		return fmt.Errorf("create Codex config directory: %w", err)
 	}
 	configPath := filepath.Join(configDir, "config.toml")
-	if err := os.WriteFile(configPath, []byte(dockerCodexConfig), 0600); err != nil {
+	quotedURL, err := json.Marshal(baseURL)
+	if err != nil {
+		return fmt.Errorf("encode provider URL: %w", err)
+	}
+	providerConfig := strings.Replace(dockerCodexConfig, `base_url = "https://huabot.com/v1"`, "base_url = "+string(quotedURL), 1)
+	if err := os.WriteFile(configPath, []byte(providerConfig), 0600); err != nil {
 		return fmt.Errorf("write Codex config: %w", err)
 	}
 	if err := os.Chmod(configPath, 0600); err != nil {
@@ -318,6 +331,7 @@ func newCodexCommand(ctx context.Context, c config, requestID, outputDir string,
 }
 
 func newCodexCommandSkills(ctx context.Context, c config, requestID, outputDir string, names []string, environment map[string]string, args []string) (*exec.Cmd, string, error) {
+	environment = codexRequestEnvironment(c, environment)
 	if !c.CodexDocker {
 		home := codexHomeDir(c, requestID)
 		if err := os.MkdirAll(home, 0700); err != nil {
@@ -336,7 +350,7 @@ func newCodexCommandSkills(ctx context.Context, c config, requestID, outputDir s
 	if err := os.MkdirAll(home, 0700); err != nil {
 		return nil, c.CodexDockerBin, fmt.Errorf("create Codex home: %w", err)
 	}
-	if err := prepareDockerCodexHome(home); err != nil {
+	if err := prepareDockerCodexHome(home, environment["OPENAI_BASE_URL"]); err != nil {
 		return nil, c.CodexDockerBin, err
 	}
 	dockerArgs := []string{"run", "--rm", "--name", dockerContainerName(requestID), "--init", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())}
