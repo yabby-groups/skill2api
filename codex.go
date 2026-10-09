@@ -230,6 +230,11 @@ func codexRequestEnvironment(c config, values map[string]string) map[string]stri
 		merged[key] = value
 	}
 	if c.CodexDocker {
+		if _, provided := merged["UV_PROJECT_ENVIRONMENT"]; !provided {
+			if value, ok := os.LookupEnv("UV_PROJECT_ENVIRONMENT"); ok {
+				merged["UV_PROJECT_ENVIRONMENT"] = value
+			}
+		}
 		if _, provided := merged["OPENAI_API_KEY"]; !provided {
 			if value, ok := os.LookupEnv("OPENAI_API_KEY"); ok {
 				merged["OPENAI_API_KEY"] = value

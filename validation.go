@@ -97,8 +97,15 @@ func validateSkillResources(dir string) error {
 			return nil
 		}
 		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil || !withinOrSame(dir, resolved) {
-			return errors.New("skill resource symlink escapes skill directory")
+		resource, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return relErr
+		}
+		if err != nil {
+			return fmt.Errorf("resolve skill resource symlink %q: %w", resource, err)
+		}
+		if !withinOrSame(dir, resolved) {
+			return fmt.Errorf("skill resource symlink %q escapes skill directory", resource)
 		}
 		return nil
 	})

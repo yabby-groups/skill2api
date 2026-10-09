@@ -156,6 +156,13 @@ normal request cleanup.
 
 ## Per-request Environment and Model
 
+To configure uv without changing requests or skills, set
+`UV_PROJECT_ENVIRONMENT` in the worker's startup environment. Docker mode
+forwards it to the container; use a writable container path such as
+`/workspace/.venv`. Native mode inherits it from the worker environment.
+This does not bypass skill resource validation: existing virtual environments
+with external symlinks must still be kept outside the skill package.
+
 `skill2api_generate` accepts an optional `environment` object of environment
 variable names to values. Its values are passed only to the Codex subprocess;
 they are never saved in `status.json` or returned by `skill2api_status`.

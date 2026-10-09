@@ -284,8 +284,30 @@ func TestSkillNamesRejectsResourceSymlinkOutsideSkillPackage(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(c.SkillsDir, "demo", "references")); err != nil {
 		t.Skipf("symbolic links unavailable: %v", err)
 	}
-	if _, err := skillNames(c, "demo"); err == nil {
-		t.Fatal("skill resource symlink outside selected package was accepted")
+	if _, err := skillNames(c, "demo"); err == nil || !strings.Contains(err.Error(), `symlink "references" escapes skill directory`) {
+		t.Fatalf("expected resource-specific containment error, got %v", err)
+	}
+}
+
+func TestCodexDockerInheritsUVProjectEnvironment(t *testing.T) {
+	t.Setenv("UV_PROJECT_ENVIRONMENT", "/workspace/.venv")
+	got := codexRequestEnvironment(config{CodexDocker: true}, nil)
+	if got["UV_PROJECT_ENVIRONMENT"] != "/workspace/.venv" {
+		t.Fatalf("worker uv environment was not forwarded: %v", got)
+	}
+	got = codexRequestEnvironment(config{CodexDocker: true}, map[string]string{"UV_PROJECT_ENVIRONMENT": "/workspace/custom"})
+	if got["UV_PROJECT_ENVIRONMENT"] != "/workspace/custom" {
+		t.Fatalf("request uv environment was overridden: %v", got)
+	}
+}
+
+func TestSkillNamesReportsBrokenResourceSymlink(t *testing.T) {
+	c, _ := testConfig(t)
+	if err := os.Symlink("missing.txt", filepath.Join(c.SkillsDir, "demo", "reference")); err != nil {
+		t.Skipf("symbolic links unavailable: %v", err)
+	}
+	if _, err := skillNames(c, "demo"); err == nil || !strings.Contains(err.Error(), `resolve skill resource symlink "reference"`) || strings.Contains(err.Error(), "escapes") {
+		t.Fatalf("expected resource-specific resolution error, got %v", err)
 	}
 }
 
