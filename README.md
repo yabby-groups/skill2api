@@ -163,6 +163,10 @@ forwards it to the container; use a writable container path such as
 This does not bypass skill resource validation: existing virtual environments
 with external symlinks must still be kept outside the skill package.
 
+`VIRTUAL_ENV` follows the same forwarding rule: for example, set
+`export VIRTUAL_ENV=/opt/.venv` before starting the worker. A request's
+`environment` value takes precedence over the worker's startup value.
+
 `skill2api_generate` accepts an optional `environment` object of environment
 variable names to values. Its values are passed only to the Codex subprocess;
 they are never saved in `status.json` or returned by `skill2api_status`.

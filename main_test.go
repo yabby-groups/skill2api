@@ -301,6 +301,18 @@ func TestCodexDockerInheritsUVProjectEnvironment(t *testing.T) {
 	}
 }
 
+func TestCodexDockerInheritsVirtualEnv(t *testing.T) {
+	t.Setenv("VIRTUAL_ENV", "/opt/.venv")
+	got := codexRequestEnvironment(config{CodexDocker: true}, nil)
+	if got["VIRTUAL_ENV"] != "/opt/.venv" {
+		t.Fatal("worker VIRTUAL_ENV was not forwarded")
+	}
+	got = codexRequestEnvironment(config{CodexDocker: true}, map[string]string{"VIRTUAL_ENV": "/workspace/custom"})
+	if got["VIRTUAL_ENV"] != "/workspace/custom" {
+		t.Fatal("request VIRTUAL_ENV was overridden")
+	}
+}
+
 func TestSkillNamesReportsBrokenResourceSymlink(t *testing.T) {
 	c, _ := testConfig(t)
 	if err := os.Symlink("missing.txt", filepath.Join(c.SkillsDir, "demo", "reference")); err != nil {

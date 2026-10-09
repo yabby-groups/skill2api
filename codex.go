@@ -225,11 +225,16 @@ func commandExitCode(err error) int {
 }
 
 func codexRequestEnvironment(c config, values map[string]string) map[string]string {
-	merged := make(map[string]string, len(values)+2)
+	merged := make(map[string]string, len(values)+3)
 	for key, value := range values {
 		merged[key] = value
 	}
 	if c.CodexDocker {
+		if _, provided := merged["VIRTUAL_ENV"]; !provided {
+			if value, ok := os.LookupEnv("VIRTUAL_ENV"); ok {
+				merged["VIRTUAL_ENV"] = value
+			}
+		}
 		if _, provided := merged["UV_PROJECT_ENVIRONMENT"]; !provided {
 			if value, ok := os.LookupEnv("UV_PROJECT_ENVIRONMENT"); ok {
 				merged["UV_PROJECT_ENVIRONMENT"] = value
