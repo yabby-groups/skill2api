@@ -226,6 +226,11 @@ func handleFileDelivery(job periodic.Job, store *statusStore, c config) {
 		return
 	}
 	if !execute {
+		delivery, err = store.readDelivery(req.RequestID, req.DeliveryID)
+		if err != nil {
+			doneJSON(job, map[string]any{"request_id": req.RequestID, "delivery_id": req.DeliveryID, "status": "failed", "error": err.Error()})
+			return
+		}
 		log.Printf("event=skill2api_file_delivery request_id=%s delivery_id=%s result=reused file_key=%s", req.RequestID, req.DeliveryID, delivery.FileKey)
 		doneJSON(job, delivery)
 		return

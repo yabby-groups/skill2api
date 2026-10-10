@@ -103,6 +103,23 @@ func TestListFilesOrdersByModificationTime(t *testing.T) {
 }
 
 func TestUploadTemporaryFileUsesTokenCredentialAndReturnsRelativeURL(t *testing.T) {
+	store := &statusStore{root: t.TempDir()}
+	key := fileKeyForData([]byte("video"))
+	previous := fileDeliveryStatus{
+		RequestID: "request-1", DeliveryID: "old-delivery", FileKey: key,
+		Status: "succeeded", URL: "/upload/expired.mp4",
+	}
+	if err := store.finishDelivery(previous); err != nil {
+		t.Fatal(err)
+	}
+	next := fileDeliveryStatus{
+		RequestID: previous.RequestID, DeliveryID: "new-delivery",
+		FileKey: key, Status: "running",
+	}
+	if execute, err := store.startDelivery(next); err != nil || !execute {
+		t.Fatalf("expired remote file was blocked by cached success: %t, %v", execute, err)
+	}
+	uploads := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/file/temporary/resolve/" && r.Method == http.MethodPost {
 			w.WriteHeader(http.StatusNotFound)
@@ -115,6 +132,7 @@ func TestUploadTemporaryFileUsesTokenCredentialAndReturnsRelativeURL(t *testing.
 		if r.Header.Get("Authorization") != "Bearer private-key" {
 			t.Fatalf("unexpected authorization header: %q", r.Header.Get("Authorization"))
 		}
+		uploads++
 		if err := r.ParseMultipartForm(1024); err != nil {
 			t.Fatal(err)
 		}
@@ -141,7 +159,9 @@ func TestUploadTemporaryFileUsesTokenCredentialAndReturnsRelativeURL(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := fileKeyForData([]byte("video"))
+	if uploads != 1 {
+		t.Fatalf("expired file upload count = %d, want 1", uploads)
+	}
 	if string(file) != fmt.Sprintf(`{"file_key":%q,"file_ext":"mp4"}`, key) || uploadURL != fmt.Sprintf("/upload/%s/%s/%s.mp4", key[:2], key[2:4], key) {
 		t.Fatalf("unexpected upload result: file=%s url=%q", file, uploadURL)
 	}
@@ -208,6 +228,16 @@ func TestDeliveryStatusSharesContentKeyState(t *testing.T) {
 	}
 	if got.Status != "succeeded" || got.URL != first.URL || got.DeliveryID != "delivery-2" {
 		t.Fatalf("shared delivery = %#v", got)
+	}
+	third := second
+	third.DeliveryID = "delivery-3"
+	execute, err = store.startDelivery(third)
+	if err != nil || !execute {
+		t.Fatalf("completed delivery must resolve remotely again: (%t, %v)", execute, err)
+	}
+	got, err = store.readDelivery(third.RequestID, third.DeliveryID)
+	if err != nil || got.Status != "running" || got.URL != "" {
+		t.Fatalf("new delivery retained stale success: %#v, %v", got, err)
 	}
 }
 

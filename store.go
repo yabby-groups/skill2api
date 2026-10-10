@@ -115,7 +115,7 @@ func (s *statusStore) startDelivery(value fileDeliveryStatus) (bool, error) {
 	defer s.mu.Unlock()
 	keyPath := s.deliveryKeyPath(value.RequestID, value.FileKey)
 	if current, err := readDeliveryFile(keyPath); err == nil &&
-		(current.Status == "queued" || current.Status == "running" || current.Status == "succeeded") {
+		(current.Status == "queued" || current.Status == "running") {
 		value.Status = current.Status
 		value.SharedDeliveryID = current.DeliveryID
 		value.File = current.File
@@ -124,6 +124,8 @@ func (s *statusStore) startDelivery(value fileDeliveryStatus) (bool, error) {
 		value.Attempts = current.Attempts
 		return false, writeDeliveryFile(s.deliveryPath(value.RequestID, value.DeliveryID), value)
 	}
+	// Completed uploads must pass through the remote resolver again: temporary
+	// files can expire independently of this worker's persisted delivery state.
 	if err := writeDeliveryFile(s.deliveryPath(value.RequestID, value.DeliveryID), value); err != nil {
 		return false, err
 	}
