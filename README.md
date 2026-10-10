@@ -97,6 +97,9 @@ Codex writes complete output directly to
 are updated while Codex runs. The worker does not rewrite `status.json` for
 output changes: `skill2api_status` reads log tails and rebuilds `files` from
 the current output directory without persisting either update.
+Each execution and resume starts a new section in `stdout.log` with a separator
+such as `==================== SKILL2API STDOUT | resume | <UTC timestamp> ====================`.
+Separators also appear in status log tails when within the configured byte limit.
 Caller-provided prompts and resume answers are redacted before either log is
 written. Codex session IDs are also redacted from public logs and status
 responses; the worker retains the ID privately for resume.

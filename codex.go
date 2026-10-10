@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 type inputRequest struct {
@@ -188,6 +189,15 @@ func runCodexCommandSkills(ctx context.Context, c config, requestID, outputDir s
 		return "", "", "", err
 	}
 	log.Printf("event=skill2api_codex_start output_dir=%s codex_bin=%s timeout=%s", outputDir, executable, c.Timeout)
+	phase := "execute"
+	if appendLogs {
+		phase = "resume"
+	}
+	if _, err := fmt.Fprintf(stdoutLog, "\n==================== SKILL2API STDOUT | %s | %s ====================\n", phase, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		_ = stdoutLog.Close()
+		_ = stderrLog.Close()
+		return "", "", "", fmt.Errorf("write %s separator: %w", stdoutLogName, err)
+	}
 	stdoutWriter := &redactingLogWriter{file: stdoutLog, redactions: redactions, redact: !c.Debug}
 	stderrWriter := &redactingLogWriter{file: stderrLog, redactions: redactions, redact: !c.Debug, onSessionID: onSessionID}
 	cmd.Stdout, cmd.Stderr = stdoutWriter, stderrWriter

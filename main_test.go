@@ -1215,7 +1215,7 @@ func TestRunCodexWritesOutputLogsAndReadsTail(t *testing.T) {
 		t.Fatalf("unexpected summaries: stdout=%q stderr=%q", stdout, stderr)
 	}
 	stdoutLog, err := os.ReadFile(filepath.Join(out, stdoutLogName))
-	if err != nil || string(stdoutLog) != "1234567890abcdefghij" {
+	if err != nil || !strings.HasSuffix(string(stdoutLog), "\n1234567890abcdefghij") || strings.Count(string(stdoutLog), "SKILL2API STDOUT | execute |") != 1 {
 		t.Fatalf("unexpected stdout log: %q err=%v", stdoutLog, err)
 	}
 	stderrLog, err := os.ReadFile(filepath.Join(out, stderrLogName))
@@ -1252,6 +1252,7 @@ func TestRunCodexExitAndTimeout(t *testing.T) {
 
 func TestRunCodexResumeAppendsLogs(t *testing.T) {
 	c, root := testConfig(t)
+	c.MaxOutput = 4096
 	bin := filepath.Join(root, "fake-codex")
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf 'out'\nprintf 'err' >&2\n"), 0700); err != nil {
 		t.Fatal(err)
@@ -1268,16 +1269,62 @@ func TestRunCodexResumeAppendsLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stdoutTail != "out" || stderrTail != "err" {
+	if !strings.HasPrefix(stdoutTail, "\n==================== SKILL2API STDOUT | resume |") || !strings.HasSuffix(stdoutTail, "\nout") || strings.Count(stdoutTail, "SKILL2API STDOUT") != 1 || stderrTail != "err" {
 		t.Fatalf("resume output included a prior execution: stdout=%q stderr=%q", stdoutTail, stderrTail)
 	}
 	stdout, err := os.ReadFile(filepath.Join(out, stdoutLogName))
-	if err != nil || string(stdout) != "outout" {
+	if err != nil || strings.Count(string(stdout), "SKILL2API STDOUT | execute |") != 1 || strings.Count(string(stdout), "SKILL2API STDOUT | resume |") != 1 || !strings.Contains(string(stdout), "\nout\n====================") || !strings.HasSuffix(string(stdout), stdoutTail) {
 		t.Fatalf("unexpected appended stdout log: %q err=%v", stdout, err)
 	}
 	stderr, err := os.ReadFile(filepath.Join(out, stderrLogName))
 	if err != nil || string(stderr) != "errerr" {
 		t.Fatalf("unexpected appended stderr log: %q err=%v", stderr, err)
+	}
+}
+
+func TestRunCodexSeparatorsPreserveInputRequest(t *testing.T) {
+	c, root := testConfig(t)
+	c.MaxOutput = 4096
+	bin := filepath.Join(root, "fake-codex")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf 'SKILL2API_INPUT_REQUIRED\\n{\"question\":\"Next?\",\"options\":[\"yes\"]}'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	c.CodexBin = bin
+	out := filepath.Join(root, "request-1")
+	if err := os.MkdirAll(out, 0750); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"execute", "resume"} {
+		offset, err := outputLogSize(filepath.Join(out, stdoutLogName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var stdout string
+		if phase == "execute" {
+			stdout, _, err = runCodex(context.Background(), c, generateRequest{OutputDir: out}, nil)
+		} else {
+			stdout, _, err = runCodexResume(context.Background(), c, taskStatus{OutputDir: out, SessionID: "session-1"}, "answer", "", nil)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(stdout, "\n")
+		prefix := "==================== SKILL2API STDOUT | " + phase + " | "
+		if len(lines) < 2 || !strings.HasPrefix(lines[1], prefix) || !strings.HasSuffix(lines[1], " ====================") {
+			t.Fatalf("invalid separator: %q", stdout)
+		}
+		stamp := strings.TrimSuffix(strings.TrimPrefix(lines[1], prefix), " ====================")
+		if parsed, err := time.Parse(time.RFC3339Nano, stamp); err != nil || parsed.Location() != time.UTC {
+			t.Fatalf("invalid UTC timestamp: %q err=%v", stamp, err)
+		}
+		input, needed, err := inputRequestFromLogSince(out, offset)
+		if err != nil || !needed || input.Question != "Next?" || len(input.Options) != 1 || input.Options[0] != "yes" {
+			t.Fatalf("%s input parsing: input=%+v needed=%t err=%v", phase, input, needed, err)
+		}
+		status, err := statusWithLogOutput(taskStatus{OutputDir: out}, c.MaxOutput)
+		if err != nil || !strings.Contains(status.Stdout, prefix) {
+			t.Fatalf("status missing separator: stdout=%q err=%v", status.Stdout, err)
+		}
 	}
 }
 
@@ -1300,7 +1347,7 @@ func TestRunCodexWritesLogsBeforeCompletion(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		output, err := os.ReadFile(filepath.Join(out, stdoutLogName))
-		if err == nil && string(output) == "started\n" {
+		if err == nil && strings.Contains(string(output), "SKILL2API STDOUT | execute |") && strings.HasSuffix(string(output), "\nstarted\n") {
 			select {
 			case err := <-done:
 				t.Fatalf("Codex finished before running-log assertion: %v", err)
