@@ -129,7 +129,7 @@ func handleStatus(job periodic.Job, store *statusStore, c config) {
 		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "failed", "error": err.Error()})
 		return
 	}
-	if files, listErr := listFiles(v.OutputDir); listErr != nil {
+	if files, listErr := listFiles(workspaceFor(v.OutputDir).hostPath); listErr != nil {
 		log.Printf("event=skill2api_status request_id=%s result=file_list_failed error=%q", req.RequestID, listErr)
 	} else {
 		v.Files = files
@@ -170,7 +170,7 @@ func handleFile(job periodic.Job, store *statusStore, c config) {
 		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "failed", "error": err.Error()})
 		return
 	}
-	data, err := readTaskFile(v.OutputDir, req.FilePath, c.MaxFileBytes)
+	data, err := readTaskFile(workspaceFor(v.OutputDir).hostPath, req.FilePath, c.MaxFileBytes)
 	if err != nil {
 		log.Printf("event=skill2api_file request_id=%s result=file_read_failed error=%q", req.RequestID, err)
 		doneJSON(job, map[string]any{"request_id": req.RequestID, "status": "failed", "error": err.Error()})
@@ -210,7 +210,7 @@ func handleFileDelivery(job periodic.Job, store *statusStore, c config) {
 		doneJSON(job, map[string]any{"request_id": req.RequestID, "delivery_id": req.DeliveryID, "status": "not_found", "error": "request not found"})
 		return
 	}
-	data, err := readTaskFile(v.OutputDir, req.FilePath, c.MaxFileBytes)
+	data, err := readTaskFile(workspaceFor(v.OutputDir).hostPath, req.FilePath, c.MaxFileBytes)
 	if err != nil {
 		doneJSON(job, map[string]any{"request_id": req.RequestID, "delivery_id": req.DeliveryID, "status": "failed", "error": err.Error()})
 		return

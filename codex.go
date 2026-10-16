@@ -107,9 +107,6 @@ func codexPrompt(prompt string, skill []byte) string {
 }
 
 func codexPromptSkills(prompt string, skills [][]byte, names []string, docker bool) string {
-	if len(skills) == 1 && !docker {
-		return codexPrompt(prompt, skills[0])
-	}
 	var out strings.Builder
 	out.WriteString(prompt)
 	for _, skill := range skills {
@@ -122,6 +119,13 @@ func codexPromptSkills(prompt string, skills [][]byte, names []string, docker bo
 			fmt.Fprintf(&out, "- %s: %s\n", name, dockerSkillDir(name))
 		}
 	}
+	if docker {
+		// The Docker resource map already ends with a newline.
+		out.WriteString("\n")
+	} else {
+		out.WriteString("\n\n")
+	}
+	out.WriteString(workspaceFor("").artifactInstruction(docker))
 	return out.String()
 }
 
@@ -132,7 +136,8 @@ func runCodexWithSessionCallback(ctx context.Context, c config, req generateRequ
 func runCodexWithSessionCallbackSkills(ctx context.Context, c config, req generateRequest, skills [][]byte, names []string, onSessionID func(string)) (string, string, string, error) {
 	environment := codexRequestEnvironment(c, req.Environment)
 	redactions := append(redactionLines(req.Prompt), environmentRedactions(environment)...)
-	return runCodexCommandSkills(ctx, c, req.RequestID, req.OutputDir, names, false, environment, redactions, onSessionID, codexExecArgs(c, req.Model, req.OutputDir, []string{codexPromptSkills(req.Prompt, skills, names, c.CodexDocker)}))
+	workspace := workspaceFor(req.OutputDir)
+	return runCodexCommandSkills(ctx, c, req.RequestID, workspace.hostPath, names, false, environment, redactions, onSessionID, codexExecArgs(c, req.Model, workspace.hostPath, []string{codexPromptSkills(req.Prompt, skills, names, c.CodexDocker)}))
 }
 
 func runCodexResume(ctx context.Context, c config, req taskStatus, answer, instruction string, environment map[string]string) (string, string, error) {
@@ -144,6 +149,7 @@ func runCodexResume(ctx context.Context, c config, req taskStatus, answer, instr
 		prompt += fmt.Sprintf("\n\nAdditional user instruction: %s", instruction)
 	}
 	prompt += "\n\nIf another clarification is required, end your response with exactly two lines: SKILL2API_INPUT_REQUIRED and then a JSON object containing question and optional options."
+	prompt += "\n\n" + workspaceFor(req.OutputDir).artifactInstruction(c.CodexDocker)
 	var names []string
 	if c.CodexDocker {
 		var err error
@@ -168,7 +174,8 @@ func runCodexCommand(ctx context.Context, c config, requestID, outputDir string,
 }
 
 func runCodexCommandSkills(ctx context.Context, c config, requestID, outputDir string, names []string, appendLogs bool, environment map[string]string, redactions []string, onSessionID func(string), args []string) (string, string, string, error) {
-	stdoutOffset, stderrOffset, err := outputLogOffsets(outputDir)
+	workspace := workspaceFor(outputDir)
+	stdoutOffset, stderrOffset, err := outputLogOffsets(workspace.hostPath)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -178,17 +185,17 @@ func runCodexCommandSkills(ctx context.Context, c config, requestID, outputDir s
 	if !appendLogs {
 		stdoutOffset, stderrOffset = 0, 0
 	}
-	stdoutLog, stderrLog, err := openOutputLogs(outputDir, appendLogs)
+	stdoutLog, stderrLog, err := openOutputLogs(workspace.hostPath, appendLogs)
 	if err != nil {
 		return "", "", "", err
 	}
-	cmd, executable, err := newCodexCommandSkills(ctx, c, requestID, outputDir, names, environment, args)
+	cmd, executable, err := newCodexCommandSkills(ctx, c, requestID, workspace.hostPath, names, environment, args)
 	if err != nil {
 		_ = stdoutLog.Close()
 		_ = stderrLog.Close()
 		return "", "", "", err
 	}
-	log.Printf("event=skill2api_codex_start output_dir=%s codex_bin=%s timeout=%s", outputDir, executable, c.Timeout)
+	log.Printf("event=skill2api_codex_start output_dir=%s codex_bin=%s timeout=%s", workspace.hostPath, executable, c.Timeout)
 	phase := "execute"
 	if appendLogs {
 		phase = "resume"
@@ -203,8 +210,8 @@ func runCodexCommandSkills(ctx context.Context, c config, requestID, outputDir s
 	cmd.Stdout, cmd.Stderr = stdoutWriter, stderrWriter
 	err = cmd.Run()
 	closeErr := closeOutputLogs(stdoutWriter, stderrWriter)
-	stdout, stdoutErr := readOutputTailSince(filepath.Join(outputDir, stdoutLogName), stdoutOffset, c.MaxOutput)
-	stderr, stderrErr := readOutputTailSince(filepath.Join(outputDir, stderrLogName), stderrOffset, c.MaxOutput)
+	stdout, stdoutErr := readOutputTailSince(filepath.Join(workspace.hostPath, stdoutLogName), stdoutOffset, c.MaxOutput)
+	stderr, stderrErr := readOutputTailSince(filepath.Join(workspace.hostPath, stderrLogName), stderrOffset, c.MaxOutput)
 	if closeErr != nil {
 		return stdout, stderr, stderrWriter.sessionID, closeErr
 	}
@@ -268,10 +275,9 @@ func codexRequestEnvironment(c config, values map[string]string) map[string]stri
 }
 
 func codexExecArgs(c config, model, outputDir string, tail []string) []string {
-	workDir := outputDir
+	workDir := workspaceFor(outputDir).codexDir(c.CodexDocker)
 	sandbox := "workspace-write"
 	if c.CodexDocker {
-		workDir = "/workspace"
 		sandbox = "danger-full-access"
 	}
 	args := []string{"exec"}
@@ -374,10 +380,11 @@ func newCodexCommandSkills(ctx context.Context, c config, requestID, outputDir s
 		return nil, c.CodexDockerBin, err
 	}
 	dockerArgs := []string{"run", "--rm", "--name", dockerContainerName(requestID), "--init", "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())}
+	workspace := workspaceFor(outputDir)
 	dockerArgs = append(dockerArgs,
-		"--mount", "type=bind,src="+outputDir+",dst=/workspace",
+		"--mount", "type=bind,src="+workspace.hostPath+",dst="+dockerWorkspaceDir,
 		"--mount", "type=bind,src="+home+",dst=/home/ubuntu",
-		"--workdir", "/workspace",
+		"--workdir", dockerWorkspaceDir,
 		"--env", "HOME=/home/ubuntu",
 	)
 	for _, name := range names {
@@ -406,7 +413,7 @@ func newCodexCommandSkills(ctx context.Context, c config, requestID, outputDir s
 	// runs must include the executable that native exec.Command supplies.
 	dockerArgs = append(dockerArgs, c.CodexBin)
 	dockerArgs = append(dockerArgs, args...)
-	log.Printf("event=skill2api_codex_command mode=docker docker_bin=%s image=%s network_access=true opt_dir_mounted=%t skill_count=%d output_dir=%s container_workdir=/workspace container_home=/home/ubuntu codex_subcommand=%s", c.CodexDockerBin, c.CodexDockerImage, c.CodexDockerOptDir != "", len(names), outputDir, codexSubcommand(args))
+	log.Printf("event=skill2api_codex_command mode=docker docker_bin=%s image=%s network_access=true opt_dir_mounted=%t skill_count=%d output_dir=%s container_workdir=%s container_home=/home/ubuntu codex_subcommand=%s", c.CodexDockerBin, c.CodexDockerImage, c.CodexDockerOptDir != "", len(names), outputDir, dockerWorkspaceDir, codexSubcommand(args))
 	cmd := exec.CommandContext(ctx, c.CodexDockerBin, dockerArgs...)
 	cmd.Env = codexEnvironment(os.Environ(), dockerEnv, c.CodexNoProxy)
 	return cmd, c.CodexDockerBin, nil

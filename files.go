@@ -60,7 +60,7 @@ func listFiles(dir string) ([]string, error) {
 
 // captureExistingFiles preserves artifacts produced before an interrupted run.
 func captureExistingFiles(v *taskStatus) {
-	files, err := listFiles(v.OutputDir)
+	files, err := listFiles(workspaceFor(v.OutputDir).hostPath)
 	if err != nil {
 		log.Printf("event=skill2api_files request_id=%s result=list_failed error=%q", v.RequestID, err)
 		return

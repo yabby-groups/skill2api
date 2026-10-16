@@ -100,7 +100,8 @@ func execute(store *statusStore, manager *taskManager, c config, req generateReq
 	if current, readErr := store.read(req.RequestID); readErr == nil && current.Status == "terminated" {
 		return
 	}
-	stderr, readErr := readOutputTail(filepath.Join(req.OutputDir, stderrLogName), c.MaxOutput)
+	workspace := workspaceFor(req.OutputDir)
+	stderr, readErr := readOutputTail(filepath.Join(workspace.hostPath, stderrLogName), c.MaxOutput)
 	if readErr != nil {
 		v.Status = "failed"
 		v.Error = fmt.Errorf("read %s: %w", stderrLogName, readErr).Error()
@@ -118,7 +119,7 @@ func execute(store *statusStore, manager *taskManager, c config, req generateReq
 		return
 	}
 	v.Status = "succeeded"
-	v.Files, err = listFiles(req.OutputDir)
+	v.Files, err = listFiles(workspaceFor(req.OutputDir).hostPath)
 	if err != nil {
 		v.Status = "failed"
 		v.Error = err.Error()
@@ -136,7 +137,8 @@ func executeResume(store *statusStore, manager *taskManager, c config, req resum
 		cancel()
 		return
 	}
-	stdoutOffset, err := outputLogSize(filepath.Join(v.OutputDir, stdoutLogName))
+	workspace := workspaceFor(v.OutputDir)
+	stdoutOffset, err := outputLogSize(filepath.Join(workspace.hostPath, stdoutLogName))
 	if err == nil {
 		_, _, err = runCodexResume(ctx, c, v, req.Answer, req.Instruction, req.Environment)
 	}
@@ -157,7 +159,7 @@ func executeResume(store *statusStore, manager *taskManager, c config, req resum
 			v.Error = ""
 		}
 	} else {
-		stderr, readErr := readOutputTail(filepath.Join(v.OutputDir, stderrLogName), c.MaxOutput)
+		stderr, readErr := readOutputTail(filepath.Join(workspace.hostPath, stderrLogName), c.MaxOutput)
 		if readErr != nil {
 			v.Status, v.Error = "failed", fmt.Sprintf("read %s: %v", stderrLogName, readErr)
 		} else if c.CodexDocker && v.SessionID != "" && !hasTokenUsageSummary(stderr) {
@@ -170,7 +172,7 @@ func executeResume(store *statusStore, manager *taskManager, c config, req resum
 			return
 		}
 		v.Status = "succeeded"
-		v.Files, err = listFiles(v.OutputDir)
+		v.Files, err = listFiles(workspaceFor(v.OutputDir).hostPath)
 		if err != nil {
 			v.Status, v.Error = "failed", err.Error()
 		}

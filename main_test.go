@@ -102,6 +102,45 @@ func TestListFilesOrdersByModificationTime(t *testing.T) {
 	}
 }
 
+func TestTaskWorkspaceUsesOneHostDirectoryAndDockerAlias(t *testing.T) {
+	workspace := workspaceFor("/tmp/request-1")
+	if got := workspace.codexDir(false); got != "/tmp/request-1" {
+		t.Fatalf("native workspace = %q", got)
+	}
+	if got := workspace.codexDir(true); got != dockerWorkspaceDir {
+		t.Fatalf("Docker workspace = %q", got)
+	}
+	if !strings.Contains(workspace.artifactInstruction(true), dockerWorkspaceDir) {
+		t.Fatalf("Docker artifact instruction does not name its workspace")
+	}
+}
+
+func TestWorkspaceFilesAreDiscoverableAfterStatusWasStored(t *testing.T) {
+	root := t.TempDir()
+	outputDir := filepath.Join(root, "custom", "request-1")
+	if err := os.MkdirAll(outputDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	store := &statusStore{root: root}
+	if err := store.write(taskStatus{RequestID: "request-1", Status: "running", OutputDir: outputDir}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outputDir, "brief.txt"), []byte("brief"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	v, err := store.read("request-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := listFiles(workspaceFor(v.OutputDir).hostPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(files, []string{"brief.txt"}) {
+		t.Fatalf("workspace files = %#v", files)
+	}
+}
+
 func TestUploadTemporaryFileUsesTokenCredentialAndReturnsRelativeURL(t *testing.T) {
 	store := &statusStore{root: t.TempDir()}
 	key := fileKeyForData([]byte("video"))
@@ -747,9 +786,17 @@ func TestCodexPromptSkillsPreservesContentAndAddsDockerResourceMap(t *testing.T)
 	prompt := "Make the deliverable."
 	skills := [][]byte{[]byte("first skill"), []byte("second skill")}
 	got := codexPromptSkills(prompt, skills, []string{"hypit", "imagegen"}, true)
-	want := prompt + "\n\nfirst skill\n\nsecond skill\n\nSelected skill packages are mounted read-only. Resolve package-relative resources using:\n- hypit: /skill2api/skills/hypit\n- imagegen: /skill2api/skills/imagegen\n"
+	want := prompt + "\n\nfirst skill\n\nsecond skill\n\nSelected skill packages are mounted read-only. Resolve package-relative resources using:\n- hypit: /skill2api/skills/hypit\n- imagegen: /skill2api/skills/imagegen\n\nWrite all task materials and final deliverables under /workspace (the current working directory). Do not treat status.json as an artifact destination."
 	if got != want {
 		t.Fatalf("multi-skill Docker prompt = %q, want %q", got, want)
+	}
+}
+
+func TestCodexPromptSkillsAddsNativeWorkspaceInstruction(t *testing.T) {
+	got := codexPromptSkills("Make the deliverable.", [][]byte{[]byte("skill")}, nil, false)
+	want := "Make the deliverable.\n\nskill\n\nWrite all task materials and final deliverables under the current working directory. Do not treat status.json as an artifact destination."
+	if got != want {
+		t.Fatalf("native skill prompt = %q, want %q", got, want)
 	}
 }
 

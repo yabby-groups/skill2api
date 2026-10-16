@@ -201,6 +201,12 @@ runner. Each container is named `skill2api-<request_id>` and uses Docker's
 cancelling the worker process. The prefix keeps Docker names valid when a
 request ID starts with `.`, `_`, or `-`.
 
+`/workspace` is the container name for the submitted task `output_dir`, not a
+second output location. Write every task material and final deliverable below
+the current working directory (`/workspace` in Docker); `skill2api_status`
+rebuilds `files` from that same host directory on every poll. `status.json` is
+worker metadata and must not be used as an artifact destination.
+
 Only selected skill packages are also mounted, read-only, at
 `/skill2api/skills/<skill_name>`, outside the task output mount. This avoids
 Docker creating root-owned mount target directories in the task output on the

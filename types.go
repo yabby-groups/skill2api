@@ -168,11 +168,12 @@ func publicStatus(v taskStatus) statusResponse {
 
 func statusWithLogOutput(v taskStatus, limit int) (statusResponse, error) {
 	response := publicStatus(v)
-	stdout, err := readOutputTail(filepath.Join(v.OutputDir, stdoutLogName), limit)
+	workspace := workspaceFor(v.OutputDir)
+	stdout, err := readOutputTail(filepath.Join(workspace.hostPath, stdoutLogName), limit)
 	if err != nil {
 		return response, fmt.Errorf("read %s: %w", stdoutLogName, err)
 	}
-	stderr, err := readOutputTail(filepath.Join(v.OutputDir, stderrLogName), limit)
+	stderr, err := readOutputTail(filepath.Join(workspace.hostPath, stderrLogName), limit)
 	if err != nil {
 		return response, fmt.Errorf("read %s: %w", stderrLogName, err)
 	}
