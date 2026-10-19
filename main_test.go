@@ -206,6 +206,55 @@ func TestUploadTemporaryFileUsesTokenCredentialAndReturnsRelativeURL(t *testing.
 	}
 }
 
+func TestUploadTemporaryFileNonJSONErrors(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusOK} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/file/temporary/resolve/" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte("⚠ upstream unavailable"))
+			}))
+			defer server.Close()
+			_, _, err := uploadTemporaryFile(context.Background(), config{UploadBaseURL: server.URL}, fileRequest{
+				FilePath: "result.mp4", Environment: map[string]string{"OPENAI_API_KEY": "private-key"},
+			}, []byte("video"))
+			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("HTTP %d", status)) {
+				t.Fatalf("expected HTTP status in error, got %v", err)
+			}
+			if got, want := isRetryableUploadError(err), status == http.StatusTooManyRequests || status >= http.StatusInternalServerError; got != want {
+				t.Fatalf("retryable = %t, want %t: %v", got, want, err)
+			}
+		})
+	}
+}
+
+func TestUploadTemporaryFileRetryReportsActualAttempts(t *testing.T) {
+	uploads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Accept") != "application/json" {
+			t.Errorf("unexpected Accept header: %q", r.Header.Get("Accept"))
+		}
+		if r.URL.Path == "/api/file/temporary/resolve/" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		uploads++
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("⚠ forbidden"))
+	}))
+	defer server.Close()
+	_, _, attempts, err := uploadTemporaryFileWithRetry(config{UploadBaseURL: server.URL}, fileRequest{
+		FilePath: "result.mp4", Environment: map[string]string{"OPENAI_API_KEY": "private-key"},
+	}, []byte("video"))
+	if err == nil || attempts != 1 || uploads != 1 {
+		t.Fatalf("expected one failed attempt: attempts=%d uploads=%d err=%v", attempts, uploads, err)
+	}
+}
+
 func TestUploadTemporaryFileReusesResolvedContent(t *testing.T) {
 	key := fileKeyForData([]byte("video"))
 	uploaded := false

@@ -157,6 +157,7 @@ func resolveTemporaryFile(ctx context.Context, c config, apiKey, fileKey string)
 		return nil, "", false, fmt.Errorf("create temporary file resolve request: %w", err)
 	}
 	request.Header.Set("Authorization", "Bearer "+apiKey)
+	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Content-Type", "application/json")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
@@ -230,6 +231,7 @@ func uploadTemporaryFile(ctx context.Context, c config, req fileRequest, data []
 		return nil, "", fmt.Errorf("create upload request: %w", err)
 	}
 	request.Header.Set("Authorization", "Bearer "+apiKey)
+	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
@@ -244,11 +246,9 @@ func uploadTemporaryFile(ctx context.Context, c config, req fileRequest, data []
 		return nil, "", errors.New("upload response exceeds maximum size")
 	}
 	var payload temporaryUploadResponse
-	if err := json.Unmarshal(responseBody, &payload); err != nil {
-		return nil, "", fmt.Errorf("decode upload response: %w", err)
-	}
+	decodeErr := json.Unmarshal(responseBody, &payload)
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		if payload.Err != "" {
+		if decodeErr == nil && payload.Err != "" {
 			return nil, "", &uploadRequestError{
 				err:       fmt.Errorf("upload temporary file: %s", payload.Err),
 				retryable: response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError,
@@ -258,6 +258,9 @@ func uploadTemporaryFile(ctx context.Context, c config, req fileRequest, data []
 			err:       fmt.Errorf("upload temporary file returned HTTP %d", response.StatusCode),
 			retryable: response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError,
 		}
+	}
+	if decodeErr != nil {
+		return nil, "", fmt.Errorf("decode upload response (HTTP %d; Content-Type %q): %w", response.StatusCode, response.Header.Get("Content-Type"), decodeErr)
 	}
 	var uploaded uploadedFile
 	if len(payload.File) == 0 || json.Unmarshal(payload.File, &uploaded) != nil || len(uploaded.FileKey) < 4 || strings.TrimSpace(uploaded.FileExt) == "" {
@@ -278,18 +281,20 @@ func uploadTemporaryFileWithRetry(c config, req fileRequest, data []byte) (json.
 		uploadTimeout = fileUploadTimeout
 	}
 	var lastErr error
-	for attempt := 1; attempt <= fileUploadAttempts; attempt++ {
+	attempts := 0
+	for attempts < fileUploadAttempts {
+		attempts++
 		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 		file, uploadURL, err := uploadTemporaryFile(ctx, c, req, data)
 		cancel()
 		if err == nil {
-			return file, uploadURL, attempt, nil
+			return file, uploadURL, attempts, nil
 		}
 		lastErr = err
-		if !isRetryableUploadError(err) || attempt == fileUploadAttempts {
+		if !isRetryableUploadError(err) || attempts == fileUploadAttempts {
 			break
 		}
-		time.Sleep(time.Duration(attempt) * time.Second)
+		time.Sleep(time.Duration(attempts) * time.Second)
 	}
-	return nil, "", fileUploadAttempts, lastErr
+	return nil, "", attempts, lastErr
 }
